@@ -658,3 +658,30 @@ func (suite *MigratorTestSuite) TestCutOverLossDataCaseLockGhostBeforeRename() {
 func TestMigrator(t *testing.T) {
 	suite.Run(t, new(MigratorTestSuite))
 }
+
+func TestMigratorVerifyRowCount(t *testing.T) {
+	migrationContext := base.NewMigrationContext()
+	migrationContext.VerifyRowCountBeforeCutOverAccuracy = 5
+	migrationContext.RowsEstimate = 100
+	migrationContext.TotalRowsCopied = 100
+	migrator := NewMigrator(migrationContext, "1.2.3")
+
+	err := migrator.verifyRowCount()
+	assert.NoError(t, err)
+
+	migrationContext.TotalRowsCopied = 95
+	err = migrator.verifyRowCount()
+	assert.NoError(t, err)
+
+	migrationContext.TotalRowsCopied = 105
+	err = migrator.verifyRowCount()
+	assert.NoError(t, err)
+
+	migrationContext.TotalRowsCopied = 94
+	err = migrator.verifyRowCount()
+	assert.Error(t, err)
+
+	migrationContext.TotalRowsCopied = 106
+	err = migrator.verifyRowCount()
+	assert.Error(t, err)
+}
