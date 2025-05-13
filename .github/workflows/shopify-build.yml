@@ -1,0 +1,42 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - 'v*-shopify-*'
+
+jobs:
+  build_and_release:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+
+    - name: Build
+      shell: bash
+      run: build.sh
+
+    - name: Get tag name
+      run: echo "SOURCE_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+
+    - name: Checksum
+      shell: bash
+      run: |
+        sha256sum /tmp/gh-ost-release/gh-ost-binary-*.tar.gz > gh-ost-${{ env.SOURCE_TAG }}.sha256sum
+        echo "sha256sum:"
+        cat gh-ost-${{ env.SOURCE_TAG }}.sha256sum
+
+    - name: Upload action artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: gh-ost-${{ env.SOURCE_TAG }}
+        path: /tmp/gh-ost-release/gh-ost-binary-*.tar.gz
+
+    - name: Create release
+      run: gh release create --prerelease ${{ env.SOURCE_TAG }} /tmp/gh-ost-release/gh-ost-binary-*.tar.gz
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
