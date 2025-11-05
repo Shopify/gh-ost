@@ -87,6 +87,7 @@ func main() {
 	flag.BoolVar(&migrationContext.AliyunRDS, "aliyun-rds", false, "set to 'true' when you execute on Aliyun RDS.")
 	flag.BoolVar(&migrationContext.GoogleCloudPlatform, "gcp", false, "set to 'true' when you execute on a 1st generation Google Cloud Platform (GCP).")
 	flag.BoolVar(&migrationContext.AzureMySQL, "azure", false, "set to 'true' when you execute on Azure Database on MySQL.")
+	flag.BoolVar(&migrationContext.UseGTIDs, "gtid", false, "(experimental) set to 'true' to use MySQL GTIDs for binlog positioning.")
 
 	flag.BoolVar(&migrationContext.VerifyRowCountBeforeCutOver, "verify-rowcount-before-cut-over", false, "(with --exact-rowcount), verifies before cut-over that copied rows match the row count")
 	flag.Int64Var(&migrationContext.VerifyRowCountBeforeCutOverAccuracy, "verify-rowcount-before-cut-over-accuracy", 2, "percentage accuracy for verifying row count before cut-over. I.e. how far do we allow the internal row count estimate to be off the actual copied rows")
@@ -109,7 +110,7 @@ func main() {
 	flag.BoolVar(&migrationContext.CutOverExponentialBackoff, "cut-over-exponential-backoff", false, "Wait exponentially longer intervals between failed cut-over attempts. Wait intervals obey a maximum configurable with 'exponential-backoff-max-interval').")
 	exponentialBackoffMaxInterval := flag.Int64("exponential-backoff-max-interval", 64, "Maximum number of seconds to wait between attempts when performing various operations with exponential backoff.")
 	chunkSize := flag.Int64("chunk-size", 1000, "amount of rows to handle in each iteration (allowed range: 10-100,000)")
-	dmlBatchSize := flag.Int64("dml-batch-size", 10, "batch size for DML events to apply in a single transaction (range 1-100)")
+	dmlBatchSize := flag.Int64("dml-batch-size", 10, "batch size for DML events to apply in a single transaction (range 1-1000)")
 	defaultRetries := flag.Int64("default-retries", 60, "Default number of retries for various operations before panicking")
 	flag.BoolVar(&migrationContext.PanicOnWarnings, "panic-on-warnings", false, "Panic when SQL warnings are encountered when copying a batch indicating data loss")
 	cutOverLockTimeoutSeconds := flag.Int64("cut-over-lock-timeout-seconds", 3, "Max number of seconds to hold locks on tables while attempting to cut-over (retry attempted when lock exceeds timeout) or attempting instant DDL")
@@ -140,11 +141,16 @@ func main() {
 	flag.Int64Var(&migrationContext.HooksStatusIntervalSec, "hooks-status-interval", 60, "how many seconds to wait between calling onStatus hook")
 
 	flag.UintVar(&migrationContext.ReplicaServerId, "replica-server-id", 99999, "server id used by gh-ost process. Default: 99999")
+	flag.BoolVar(&migrationContext.AllowSetupMetadataLockInstruments, "allow-setup-metadata-lock-instruments", false, "validate rename session hold the MDL of original table before unlock tables in cut-over phase")
 	flag.IntVar(&migrationContext.BinlogSyncerMaxReconnectAttempts, "binlogsyncer-max-reconnect-attempts", 0, "when master node fails, the maximum number of binlog synchronization attempts to reconnect. 0 is unlimited")
 
 	flag.BoolVar(&migrationContext.IncludeTriggers, "include-triggers", false, "When true, the triggers (if exist) will be created on the new table")
 	flag.StringVar(&migrationContext.TriggerSuffix, "trigger-suffix", "", "Add a suffix to the trigger name (i.e '_v2'). Requires '--include-triggers'")
 	flag.BoolVar(&migrationContext.RemoveTriggerSuffix, "remove-trigger-suffix-if-exists", false, "Remove given suffix from name of trigger. Requires '--include-triggers' and '--trigger-suffix'")
+	flag.BoolVar(&migrationContext.SkipPortValidation, "skip-port-validation", false, "Skip port validation for MySQL connections")
+	flag.BoolVar(&migrationContext.Checkpoint, "checkpoint", false, "Enable migration checkpoints")
+	flag.Int64Var(&migrationContext.CheckpointIntervalSeconds, "checkpoint-seconds", 300, "The number of seconds between checkpoints")
+	flag.BoolVar(&migrationContext.Resume, "resume", false, "Attempt to resume migration from checkpoint")
 
 	maxLoad := flag.String("max-load", "", "Comma delimited status-name=threshold. e.g: 'Threads_running=100,Threads_connected=500'. When status exceeds threshold, app throttles writes")
 	criticalLoad := flag.String("critical-load", "", "Comma delimited status-name=threshold, same format as --max-load. When status exceeds threshold, app panics and quits")
@@ -284,6 +290,9 @@ func main() {
 	if *storageEngine == "rocksdb" {
 		migrationContext.Log.Warning("RocksDB storage engine support is experimental")
 	}
+	if migrationContext.CheckpointIntervalSeconds < 10 {
+		migrationContext.Log.Fatalf("--checkpoint-seconds should be >=10")
+	}
 
 	switch *cutOver {
 	case "atomic", "default", "":
@@ -316,6 +325,7 @@ func main() {
 		}
 		migrationContext.CliPassword = string(bytePassword)
 	}
+
 	migrationContext.SetHeartbeatIntervalMilliseconds(*heartbeatIntervalMillis)
 	migrationContext.SetNiceRatio(*niceRatio)
 	migrationContext.SetChunkSize(*chunkSize)
