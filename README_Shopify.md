@@ -34,6 +34,33 @@ The following branched workflow ensures Shopify can contribute to the upstream r
 
 Generally, Shopify-specific fixes should be avoided in favor of following the contributing guidelines of `github/gh-ost` and making sure all changes can be merged upstream. This ensures the fork won't diverge and the Shopify-specific build becomes the only long-term option to use it. Don't forget to open a GitHub issue (proposal) in `github/gh-ost` before opening upstream pull requests.
 
+### Keeping the fork up to date
+
+The example assumes `origin/master` is the upstream remote tracked locally on the `gh-master` branch and `shopify-gh-ost/master` is the fork remote (this repo).
+
+```
+git remote add origin https://github.com/github/gh-ost.git
+git fetch origin master
+git switch -c gh-master origin/master
+
+git switch master
+git switch -c sync-upstream-2025-11-01
+git merge gh-master
+# resolve conflicts, if any
+git push --set-upstream shopify-gh-ost sync-upstream-2025-11-01
+# open pull request in the fork from sync-upstream-2025-11-01 to master
+```
+
+Verification
+
+```
+git switch sync-upstream-2025-11-01
+git diff gh-master
+git log gh-master..HEAD
+```
+
+Example pull request: https://github.com/Shopify/gh-ost/pull/16. Do not use the rebase or squash and merge strategies when merging the PR, so that commit history is preserved.
+
 ### Releasing gh-ost
 
 1. `git tag v1.1.7-shopify-$(git rev-parse HEAD | cut -c1-7)`
