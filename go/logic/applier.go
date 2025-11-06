@@ -1,5 +1,5 @@
 /*
-   Copyright 2022 GitHub Inc.
+   Copyright 2025 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -8,6 +8,7 @@ package logic
 import (
 	gosql "database/sql"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -20,6 +21,9 @@ import (
 	"context"
 	"database/sql/driver"
 
+	"errors"
+	"sync"
+
 	"github.com/github/gh-ost/go/mysql"
 	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/openark/golib/sqlutils"
@@ -29,6 +33,9 @@ const (
 	GhostChangelogTableComment = "gh-ost changelog"
 	atomicCutOverMagicHint     = "ghost-cut-over-sentry"
 )
+
+// ErrNoCheckpointFound is returned when an empty checkpoint table is queried.
+var ErrNoCheckpointFound = errors.New("no checkpoint found in _ghk table")
 
 type dmlBuildResult struct {
 	query     string
@@ -65,9 +72,17 @@ type Applier struct {
 	finishedMigrating int64
 	name              string
 
-	dmlDeleteQueryBuilder *sql.DMLDeleteQueryBuilder
-	dmlInsertQueryBuilder *sql.DMLInsertQueryBuilder
-	dmlUpdateQueryBuilder *sql.DMLUpdateQueryBuilder
+	CurrentCoordinatesMutex sync.Mutex
+	CurrentCoordinates      mysql.BinlogCoordinates
+
+	LastIterationRangeMutex     sync.Mutex
+	LastIterationRangeMinValues *sql.ColumnValues
+	LastIterationRangeMaxValues *sql.ColumnValues
+
+	dmlDeleteQueryBuilder        *sql.DMLDeleteQueryBuilder
+	dmlInsertQueryBuilder        *sql.DMLInsertQueryBuilder
+	dmlUpdateQueryBuilder        *sql.DMLUpdateQueryBuilder
+	checkpointInsertQueryBuilder *sql.CheckpointInsertQueryBuilder
 }
 
 func NewApplier(migrationContext *base.MigrationContext) *Applier {
@@ -142,6 +157,15 @@ func (this *Applier) prepareQueries() (err error) {
 		&this.migrationContext.UniqueKey.Columns,
 	); err != nil {
 		return err
+	}
+	if this.migrationContext.Checkpoint {
+		if this.checkpointInsertQueryBuilder, err = sql.NewCheckpointQueryBuilder(
+			this.migrationContext.DatabaseName,
+			this.migrationContext.GetCheckpointTableName(),
+			&this.migrationContext.UniqueKey.Columns,
+		); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -399,6 +423,54 @@ func (this *Applier) CreateChangelogTable() error {
 	return nil
 }
 
+// Create the checkpoint table to store the chunk copy and applier state.
+// There are two sets of columns with the same types as the shared unique key,
+// one for IterationMinValues and one for IterationMaxValues.
+func (this *Applier) CreateCheckpointTable() error {
+	if err := this.DropCheckpointTable(); err != nil {
+		return err
+	}
+	colDefs := []string{
+		"`gh_ost_chk_id` bigint auto_increment primary key",
+		"`gh_ost_chk_timestamp` bigint",
+		"`gh_ost_chk_coords` varchar(4096)",
+		"`gh_ost_chk_iteration` bigint",
+		"`gh_ost_rows_copied` bigint",
+		"`gh_ost_dml_applied` bigint",
+	}
+	for _, col := range this.migrationContext.UniqueKey.Columns.Columns() {
+		if col.MySQLType == "" {
+			return fmt.Errorf("CreateCheckpoinTable: column %s has no type information. applyColumnTypes must be called", sql.EscapeName(col.Name))
+		}
+		minColName := sql.TruncateColumnName(col.Name, sql.MaxColumnNameLength-4) + "_min"
+		colDef := fmt.Sprintf("%s %s", sql.EscapeName(minColName), col.MySQLType)
+		if !col.Nullable {
+			colDef += " NOT NULL"
+		}
+		colDefs = append(colDefs, colDef)
+	}
+
+	for _, col := range this.migrationContext.UniqueKey.Columns.Columns() {
+		maxColName := sql.TruncateColumnName(col.Name, sql.MaxColumnNameLength-4) + "_max"
+		colDef := fmt.Sprintf("%s %s", sql.EscapeName(maxColName), col.MySQLType)
+		if !col.Nullable {
+			colDef += " NOT NULL"
+		}
+		colDefs = append(colDefs, colDef)
+	}
+
+	query := fmt.Sprintf("create /* gh-ost */ table %s.%s (\n %s\n)",
+		sql.EscapeName(this.migrationContext.DatabaseName),
+		sql.EscapeName(this.migrationContext.GetCheckpointTableName()),
+		strings.Join(colDefs, ",\n "),
+	)
+	this.migrationContext.Log.Infof("Created checkpoint table")
+	if _, err := sqlutils.ExecNoPrepare(this.db, query); err != nil {
+		return err
+	}
+	return nil
+}
+
 // dropTable drops a given table on the applied host
 func (this *Applier) dropTable(tableName string) error {
 	query := fmt.Sprintf(`drop /* gh-ost */ table if exists %s.%s`,
@@ -413,6 +485,28 @@ func (this *Applier) dropTable(tableName string) error {
 		return err
 	}
 	this.migrationContext.Log.Infof("Table dropped")
+	return nil
+}
+
+func (this *Applier) StateMetadataLockInstrument() error {
+	query := `select /*+ MAX_EXECUTION_TIME(300) */ ENABLED, TIMED from performance_schema.setup_instruments WHERE NAME = 'wait/lock/metadata/sql/mdl'`
+	var enabled, timed string
+	if err := this.db.QueryRow(query).Scan(&enabled, &timed); err != nil {
+		return this.migrationContext.Log.Errorf("query performance_schema.setup_instruments with name wait/lock/metadata/sql/mdl error: %s", err)
+	}
+	if strings.EqualFold(enabled, "YES") && strings.EqualFold(timed, "YES") {
+		this.migrationContext.IsOpenMetadataLockInstruments = true
+		return nil
+	}
+	if !this.migrationContext.AllowSetupMetadataLockInstruments {
+		return nil
+	}
+	this.migrationContext.Log.Infof("instrument wait/lock/metadata/sql/mdl state: enabled %s, timed %s", enabled, timed)
+	if _, err := this.db.Exec(`UPDATE performance_schema.setup_instruments SET ENABLED = 'YES', TIMED = 'YES' WHERE NAME = 'wait/lock/metadata/sql/mdl'`); err != nil {
+		return this.migrationContext.Log.Errorf("enable instrument wait/lock/metadata/sql/mdl error: %s", err)
+	}
+	this.migrationContext.IsOpenMetadataLockInstruments = true
+	this.migrationContext.Log.Infof("instrument wait/lock/metadata/sql/mdl enabled")
 	return nil
 }
 
@@ -471,6 +565,11 @@ func (this *Applier) DropChangelogTable() error {
 	return this.dropTable(this.migrationContext.GetChangelogTableName())
 }
 
+// DropCheckpointTable drops the checkpoint table on applier host
+func (this *Applier) DropCheckpointTable() error {
+	return this.dropTable(this.migrationContext.GetCheckpointTableName())
+}
+
 // DropOldTable drops the _Old table on the applier host
 func (this *Applier) DropOldTable() error {
 	return this.dropTable(this.migrationContext.GetOldTableName())
@@ -517,6 +616,60 @@ func (this *Applier) WriteAndLogChangelog(hint, value string) (string, error) {
 
 func (this *Applier) WriteChangelogState(value string) (string, error) {
 	return this.WriteAndLogChangelog("state", value)
+}
+
+// WriteCheckpoints writes a checkpoint to the _ghk table.
+func (this *Applier) WriteCheckpoint(chk *Checkpoint) (int64, error) {
+	var insertId int64
+	uniqueKeyArgs := sqlutils.Args(chk.IterationRangeMin.AbstractValues()...)
+	uniqueKeyArgs = append(uniqueKeyArgs, chk.IterationRangeMax.AbstractValues()...)
+	query, uniqueKeyArgs, err := this.checkpointInsertQueryBuilder.BuildQuery(uniqueKeyArgs)
+	if err != nil {
+		return insertId, err
+	}
+	args := sqlutils.Args(chk.LastTrxCoords.String(), chk.Iteration, chk.RowsCopied, chk.DMLApplied)
+	args = append(args, uniqueKeyArgs...)
+	res, err := this.db.Exec(query, args...)
+	if err != nil {
+		return insertId, err
+	}
+	return res.LastInsertId()
+}
+
+func (this *Applier) ReadLastCheckpoint() (*Checkpoint, error) {
+	row := this.db.QueryRow(fmt.Sprintf(`select /* gh-ost */ * from %s.%s order by gh_ost_chk_id desc limit 1`, this.migrationContext.DatabaseName, this.migrationContext.GetCheckpointTableName()))
+	chk := &Checkpoint{
+		IterationRangeMin: sql.NewColumnValues(this.migrationContext.UniqueKey.Columns.Len()),
+		IterationRangeMax: sql.NewColumnValues(this.migrationContext.UniqueKey.Columns.Len()),
+	}
+
+	var coordStr string
+	var timestamp int64
+	ptrs := []interface{}{&chk.Id, &timestamp, &coordStr, &chk.Iteration, &chk.RowsCopied, &chk.DMLApplied}
+	ptrs = append(ptrs, chk.IterationRangeMin.ValuesPointers...)
+	ptrs = append(ptrs, chk.IterationRangeMax.ValuesPointers...)
+	err := row.Scan(ptrs...)
+	if err != nil {
+		if errors.Is(err, gosql.ErrNoRows) {
+			return nil, ErrNoCheckpointFound
+		}
+		return nil, err
+	}
+	chk.Timestamp = time.Unix(timestamp, 0)
+	if this.migrationContext.UseGTIDs {
+		gtidCoords, err := mysql.NewGTIDBinlogCoordinates(coordStr)
+		if err != nil {
+			return nil, err
+		}
+		chk.LastTrxCoords = gtidCoords
+	} else {
+		fileCoords, err := mysql.ParseFileBinlogCoordinates(coordStr)
+		if err != nil {
+			return nil, err
+		}
+		chk.LastTrxCoords = fileCoords
+	}
+	return chk, nil
 }
 
 // InitiateHeartbeat creates a heartbeat cycle, writing to the changelog table.
@@ -663,8 +816,15 @@ func (this *Applier) ReadMigrationRangeValues() error {
 // CalculateNextIterationRangeEndValues reads the next-iteration-range-end unique key values,
 // which will be used for copying the next chunk of rows. Ir returns "false" if there is
 // no further chunk to work through, i.e. we're past the last chunk and are done with
-// iterating the range (and this done with copying row chunks)
+// iterating the range (and thus done with copying row chunks)
 func (this *Applier) CalculateNextIterationRangeEndValues() (hasFurtherRange bool, err error) {
+	this.LastIterationRangeMutex.Lock()
+	if this.migrationContext.MigrationIterationRangeMinValues != nil && this.migrationContext.MigrationIterationRangeMaxValues != nil {
+		this.LastIterationRangeMinValues = this.migrationContext.MigrationIterationRangeMinValues.Clone()
+		this.LastIterationRangeMaxValues = this.migrationContext.MigrationIterationRangeMaxValues.Clone()
+	}
+	this.LastIterationRangeMutex.Unlock()
+
 	for i := 0; i < 2; i++ {
 		buildFunc := sql.BuildUniqueKeyRangeEndPreparedQueryViaOffset
 		if i == 1 {
@@ -963,11 +1123,11 @@ func (this *Applier) StopReplication() error {
 		return err
 	}
 
-	readBinlogCoordinates, executeBinlogCoordinates, err := mysql.GetReplicationBinlogCoordinates(this.migrationContext.ApplierMySQLVersion, this.db)
+	readBinlogCoordinates, executeBinlogCoordinates, err := mysql.GetReplicationBinlogCoordinates(this.migrationContext.ApplierMySQLVersion, this.db, this.migrationContext.UseGTIDs)
 	if err != nil {
 		return err
 	}
-	this.migrationContext.Log.Infof("Replication IO thread at %+v. SQL thread is at %+v", *readBinlogCoordinates, *executeBinlogCoordinates)
+	this.migrationContext.Log.Infof("Replication IO thread at %+v. SQL thread is at %+v", readBinlogCoordinates, executeBinlogCoordinates)
 	return nil
 }
 
@@ -1092,7 +1252,7 @@ func (this *Applier) RevertAtomicCutOverWaitTimeout() {
 }
 
 // AtomicCutOverMagicLock
-func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocked chan<- error, okToUnlockTable <-chan bool, tableUnlocked chan<- error) error {
+func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocked chan<- error, okToUnlockTable <-chan bool, tableUnlocked chan<- error, renameLockSessionId *int64) error {
 	tx, err := this.db.Begin()
 	if err != nil {
 		tableLocked <- err
@@ -1183,6 +1343,20 @@ func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocke
 		// We DO NOT return here because we must `UNLOCK TABLES`!
 	}
 
+	this.migrationContext.Log.Infof("Session renameLockSessionId is %+v", *renameLockSessionId)
+	// Checking the lock is held by rename session
+	if *renameLockSessionId > 0 && this.migrationContext.IsOpenMetadataLockInstruments {
+		sleepDuration := time.Duration(10*this.migrationContext.CutOverLockTimeoutSeconds) * time.Millisecond
+		for i := 1; i <= 100; i++ {
+			err := this.ExpectMetadataLock(*renameLockSessionId)
+			if err == nil {
+				this.migrationContext.Log.Infof("Rename session is pending lock on the origin table !")
+				break
+			} else {
+				time.Sleep(sleepDuration)
+			}
+		}
+	}
 	// Tables still locked
 	this.migrationContext.Log.Infof("Releasing lock from %s.%s, %s.%s",
 		sql.EscapeName(this.migrationContext.DatabaseName),
@@ -1259,7 +1433,8 @@ func (this *Applier) updateModifiesUniqueKeyColumns(dmlEvent *binlog.BinlogDMLEv
 		tableOrdinal := this.migrationContext.OriginalTableColumns.Ordinals[column.Name]
 		whereColumnValue := dmlEvent.WhereColumnValues.AbstractValues()[tableOrdinal]
 		newColumnValue := dmlEvent.NewColumnValues.AbstractValues()[tableOrdinal]
-		if newColumnValue != whereColumnValue {
+
+		if !reflect.DeepEqual(whereColumnValue, newColumnValue) {
 			return column.Name, true
 		}
 	}
@@ -1401,4 +1576,28 @@ func (this *Applier) Teardown() {
 	this.db.Close()
 	this.singletonDB.Close()
 	atomic.StoreInt64(&this.finishedMigrating, 1)
+}
+
+func (this *Applier) ExpectMetadataLock(sessionId int64) error {
+	found := false
+	query := `
+		select /* gh-ost */ m.owner_thread_id
+			from performance_schema.metadata_locks m join performance_schema.threads t
+			on m.owner_thread_id=t.thread_id
+			where m.object_type = 'TABLE' and m.object_schema = ? and m.object_name = ?
+			and m.lock_type = 'EXCLUSIVE' and m.lock_status = 'PENDING'
+			and t.processlist_id = ?
+	`
+	err := sqlutils.QueryRowsMap(this.db, query, func(m sqlutils.RowMap) error {
+		found = true
+		return nil
+	}, this.migrationContext.DatabaseName, this.migrationContext.OriginalTableName, sessionId)
+	if err != nil {
+		return err
+	}
+	if !found {
+		err = fmt.Errorf("cannot find PENDING metadata lock on original table: `%s`.`%s`", this.migrationContext.DatabaseName, this.migrationContext.OriginalTableName)
+		return this.migrationContext.Log.Errore(err)
+	}
+	return nil
 }
