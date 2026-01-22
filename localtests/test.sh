@@ -293,6 +293,7 @@ test_single() {
     --exact-rowcount \
     --verify-rowcount-before-cut-over \
     --assume-rbr \
+    --skip-metadata-lock-check \
     --initially-drop-old-table \
     --initially-drop-ghost-table \
     --throttle-query='select timestampdiff(second, min(last_update), now()) < 5 from _${table_name}_ghc' \
