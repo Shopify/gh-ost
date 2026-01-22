@@ -104,6 +104,8 @@ type MigrationContext struct {
 	AzureMySQL               bool
 	AttemptInstantDDL        bool
 	Resume                   bool
+	Revert                   bool
+	OldTableName             string
 
 	// SkipPortValidation allows skipping the port validation in `ValidateConnection`
 	// This is useful when connecting to a MySQL instance where the external port
@@ -256,6 +258,7 @@ type MigrationContext struct {
 
 	BinlogSyncerMaxReconnectAttempts  int
 	AllowSetupMetadataLockInstruments bool
+	SkipMetadataLockCheck             bool
 	IsOpenMetadataLockInstruments     bool
 
 	Log Logger
@@ -350,6 +353,10 @@ func getSafeTableName(baseName string, suffix string) string {
 // GetGhostTableName generates the name of ghost table, based on original table name
 // or a given table name
 func (this *MigrationContext) GetGhostTableName() string {
+	if this.Revert {
+		// When reverting the "ghost" table is the _del table from the original migration.
+		return this.OldTableName
+	}
 	if this.ForceTmpTableName != "" {
 		return getSafeTableName(this.ForceTmpTableName, "gho")
 	} else {
@@ -366,14 +373,18 @@ func (this *MigrationContext) GetOldTableName() string {
 		tableName = this.OriginalTableName
 	}
 
+	suffix := "del"
+	if this.Revert {
+		suffix = "rev_del"
+	}
 	if this.TimestampOldTable {
 		t := this.StartTime
 		timestamp := fmt.Sprintf("%d%02d%02d%02d%02d%02d",
 			t.Year(), t.Month(), t.Day(),
 			t.Hour(), t.Minute(), t.Second())
-		return getSafeTableName(tableName, fmt.Sprintf("%s_del", timestamp))
+		return getSafeTableName(tableName, fmt.Sprintf("%s_%s", timestamp, suffix))
 	}
-	return getSafeTableName(tableName, "del")
+	return getSafeTableName(tableName, suffix)
 }
 
 // GetChangelogTableName generates the name of changelog table, based on original table name
