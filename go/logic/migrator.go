@@ -392,6 +392,7 @@ func (this *Migrator) createFlagFiles() (err error) {
 func (this *Migrator) Migrate() (err error) {
 	this.migrationContext.Log.Infof("Migrating %s.%s", sql.EscapeName(this.migrationContext.DatabaseName), sql.EscapeName(this.migrationContext.OriginalTableName))
 	this.migrationContext.StartTime = time.Now()
+	this.migrationContext.SetLastHeartbeatOnChangelogTime(this.migrationContext.StartTime)
 	if this.migrationContext.Hostname, err = os.Hostname(); err != nil {
 		return err
 	}
@@ -588,6 +589,7 @@ func (this *Migrator) Revert() error {
 		sql.EscapeName(this.migrationContext.DatabaseName), sql.EscapeName(this.migrationContext.OriginalTableName),
 		sql.EscapeName(this.migrationContext.DatabaseName), sql.EscapeName(this.migrationContext.OldTableName))
 	this.migrationContext.StartTime = time.Now()
+	this.migrationContext.SetLastHeartbeatOnChangelogTime(this.migrationContext.StartTime)
 	var err error
 	if this.migrationContext.Hostname, err = os.Hostname(); err != nil {
 		return err
