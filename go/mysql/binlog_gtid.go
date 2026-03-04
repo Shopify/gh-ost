@@ -7,6 +7,7 @@ package mysql
 
 import (
 	"fmt"
+	"sync"
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	uuid "github.com/google/uuid"
@@ -100,6 +101,9 @@ type LazyGTIDCoordinates struct {
 	base *gomysql.MysqlGTIDSet // last-committed GTIDSet; immutable, not owned
 	sid  uuid.UUID             // current transaction's server UUID
 	gno  int64                 // current transaction's GNO
+
+	cacheMutex         sync.Mutex
+	cachedMaterialized *GTIDBinlogCoordinates
 }
 
 // NewLazyGTIDCoordinates creates coordinates for an in-flight transaction.
@@ -113,6 +117,13 @@ func NewLazyGTIDCoordinates(base *gomysql.MysqlGTIDSet, sid uuid.UUID, gno int64
 // GTIDBinlogCoordinates. The result is an independent snapshot safe to hold across
 // transaction boundaries. This is the only point where a MysqlGTIDSet.Clone occurs.
 func (l *LazyGTIDCoordinates) Materialize() *GTIDBinlogCoordinates {
+	l.cacheMutex.Lock()
+	defer l.cacheMutex.Unlock()
+
+	if l.cachedMaterialized != nil {
+		return l.cachedMaterialized
+	}
+
 	set := l.base.Clone().(*gomysql.MysqlGTIDSet)
 	set.AddGTID(l.sid, l.gno)
 	return &GTIDBinlogCoordinates{GTIDSet: set}
