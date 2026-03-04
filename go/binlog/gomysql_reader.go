@@ -31,6 +31,16 @@ type GoMySQLReader struct {
 	// LastTrxCoords are the coordinates of the last transaction completely read.
 	// If using the file coordinates it is binlog position of the transaction's XID event.
 	LastTrxCoords mysql.BinlogCoordinates
+	// currentTrxCoords is set once per GTIDEvent and shared by all RowsEvents within
+	// the same transaction. It points to currentCoordinates (a *LazyGTIDCoordinates),
+	// which is replaced at the next GTIDEvent — so old entries retain valid references.
+	// Only accessed from within the StreamEvents goroutine; no mutex needed.
+	currentTrxCoords mysql.BinlogCoordinates
+	// lastCommittedGTIDSet is the MysqlGTIDSet from the most recently seen XIDEvent
+	// (or the initial coordinates). It is immutable once set and used as the base for
+	// LazyGTIDCoordinates so we avoid cloning the full set on each GTIDEvent.
+	// Only written from within StreamEvents; no mutex needed.
+	lastCommittedGTIDSet *gomysql.MysqlGTIDSet
 }
 
 func NewGoMySQLReader(migrationContext *base.MigrationContext) *GoMySQLReader {
@@ -68,6 +78,7 @@ func (this *GoMySQLReader) ConnectBinlogStreamer(coordinates mysql.BinlogCoordin
 	// Start sync with specified GTID set or binlog file and position
 	if this.migrationContext.UseGTIDs {
 		coords := coordinates.(*mysql.GTIDBinlogCoordinates)
+		this.lastCommittedGTIDSet = coords.GTIDSet
 		this.binlogStreamer, err = this.binlogSyncer.StartSyncGTID(coords.GTIDSet)
 	} else {
 		coords := this.currentCoordinates.(*mysql.FileBinlogCoordinates)
@@ -86,7 +97,12 @@ func (this *GoMySQLReader) GetCurrentBinlogCoordinates() mysql.BinlogCoordinates
 }
 
 func (this *GoMySQLReader) handleRowsEvent(ev *replication.BinlogEvent, rowsEvent *replication.RowsEvent, entriesChannel chan<- *BinlogEntry) error {
-	currentCoords := this.GetCurrentBinlogCoordinates()
+	var currentCoords mysql.BinlogCoordinates
+	if this.migrationContext.UseGTIDs && this.currentTrxCoords != nil {
+		currentCoords = this.currentTrxCoords
+	} else {
+		currentCoords = this.GetCurrentBinlogCoordinates()
+	}
 	dml := ToEventDML(ev.Header.EventType.String())
 	if dml == NotDML {
 		return fmt.Errorf("Unknown DML type: %s", ev.Header.EventType.String())
@@ -167,12 +183,8 @@ func (this *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesCha
 				return err
 			}
 			this.currentCoordinatesMutex.Lock()
-			if this.LastTrxCoords != nil {
-				this.currentCoordinates = this.LastTrxCoords.Clone()
-			}
-			coords := this.currentCoordinates.(*mysql.GTIDBinlogCoordinates)
-			trxGset := gomysql.NewUUIDSet(sid, gomysql.Interval{Start: event.GNO, Stop: event.GNO + 1})
-			coords.GTIDSet.AddSet(trxGset)
+			this.currentCoordinates = mysql.NewLazyGTIDCoordinates(this.lastCommittedGTIDSet, sid, event.GNO)
+			this.currentTrxCoords = this.currentCoordinates
 			this.currentCoordinatesMutex.Unlock()
 		case *replication.RotateEvent:
 			if this.migrationContext.UseGTIDs {
@@ -185,7 +197,14 @@ func (this *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesCha
 			this.currentCoordinatesMutex.Unlock()
 		case *replication.XIDEvent:
 			if this.migrationContext.UseGTIDs {
-				this.LastTrxCoords = &mysql.GTIDBinlogCoordinates{GTIDSet: event.GSet.(*gomysql.MysqlGTIDSet)}
+				gSet := event.GSet.(*gomysql.MysqlGTIDSet)
+				if coords, ok := this.LastTrxCoords.(*mysql.GTIDBinlogCoordinates); ok {
+					coords.GTIDSet = gSet
+					coords.UUIDSet = nil
+				} else {
+					this.LastTrxCoords = &mysql.GTIDBinlogCoordinates{GTIDSet: gSet}
+				}
+				this.lastCommittedGTIDSet = gSet
 			} else {
 				this.LastTrxCoords = this.currentCoordinates.Clone()
 			}

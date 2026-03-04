@@ -6,7 +6,10 @@
 package mysql
 
 import (
+	"fmt"
+
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
+	uuid "github.com/google/uuid"
 )
 
 // GTIDBinlogCoordinates describe binary log coordinates in MySQL GTID format.
@@ -85,3 +88,53 @@ func (this *GTIDBinlogCoordinates) Clone() BinlogCoordinates {
 	}
 	return out
 }
+
+// LazyGTIDCoordinates describes the in-flight coordinates of a transaction that
+// has been announced via GTIDEvent but not yet committed (XIDEvent not yet seen).
+// It holds a stable, immutable reference to the last-committed MysqlGTIDSet and
+// the current transaction's GTID. The expensive Clone of the full set is deferred
+// until Materialize is actually called, which only happens when external callers
+// need a snapshot (via GetCurrentBinlogCoordinates) or when a comparison is made —
+// not on every row event in the hot path.
+type LazyGTIDCoordinates struct {
+	base *gomysql.MysqlGTIDSet // last-committed GTIDSet; immutable, not owned
+	sid  uuid.UUID             // current transaction's server UUID
+	gno  int64                 // current transaction's GNO
+}
+
+// NewLazyGTIDCoordinates creates coordinates for an in-flight transaction.
+// base must be the MysqlGTIDSet of the last committed transaction and must
+// not be mutated after this call.
+func NewLazyGTIDCoordinates(base *gomysql.MysqlGTIDSet, sid uuid.UUID, gno int64) *LazyGTIDCoordinates {
+	return &LazyGTIDCoordinates{base: base, sid: sid, gno: gno}
+}
+
+// Materialize clones the base set, adds the in-flight GTID, and returns a full
+// GTIDBinlogCoordinates. The result is an independent snapshot safe to hold across
+// transaction boundaries. This is the only point where a MysqlGTIDSet.Clone occurs.
+func (l *LazyGTIDCoordinates) Materialize() *GTIDBinlogCoordinates {
+	set := l.base.Clone().(*gomysql.MysqlGTIDSet)
+	set.AddGTID(l.sid, l.gno)
+	return &GTIDBinlogCoordinates{GTIDSet: set}
+}
+
+func (l *LazyGTIDCoordinates) String() string        { return l.Materialize().String() }
+func (l *LazyGTIDCoordinates) DisplayString() string { return fmt.Sprintf("%s:%d", l.sid, l.gno) }
+func (l *LazyGTIDCoordinates) IsEmpty() bool         { return l.base == nil }
+
+func (l *LazyGTIDCoordinates) Equals(other BinlogCoordinates) bool {
+	return l.Materialize().Equals(other)
+}
+
+func (l *LazyGTIDCoordinates) SmallerThan(other BinlogCoordinates) bool {
+	return l.Materialize().SmallerThan(other)
+}
+
+func (l *LazyGTIDCoordinates) SmallerThanOrEquals(other BinlogCoordinates) bool {
+	return l.Materialize().SmallerThanOrEquals(other)
+}
+
+// Clone materializes the full coordinates. The returned *GTIDBinlogCoordinates is
+// an independent copy; callers receive a concrete type regardless of which
+// BinlogCoordinates implementation produced it.
+func (l *LazyGTIDCoordinates) Clone() BinlogCoordinates { return l.Materialize() }
