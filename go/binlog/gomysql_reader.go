@@ -103,17 +103,16 @@ func (this *GoMySQLReader) handleRowsEvent(ev *replication.BinlogEvent, rowsEven
 	} else {
 		currentCoords = this.GetCurrentBinlogCoordinates()
 	}
-	
-	// Use direct EventType switch instead of string conversion
-	dml := ToEventDMLFromType(ev.Header.EventType)
+
+	dml := ToEventDML(ev.Header.EventType.String())
 	if dml == NotDML {
 		return fmt.Errorf("Unknown DML type: %v", ev.Header.EventType)
 	}
-	
+
 	// Convert schema and table names once per RowsEvent, not per row
 	schemaName := string(rowsEvent.Table.Schema)
 	tableName := string(rowsEvent.Table.Table)
-	
+
 	for i, row := range rowsEvent.Rows {
 		if dml == UpdateDML && i%2 == 1 {
 			// An update has two rows (WHERE+SET)
@@ -122,7 +121,7 @@ func (this *GoMySQLReader) handleRowsEvent(ev *replication.BinlogEvent, rowsEven
 		}
 		binlogEntry := NewBinlogEntryAt(currentCoords)
 		binlogEntry.DmlEvent = NewBinlogDMLEvent(schemaName, tableName, dml)
-		
+
 		switch dml {
 		case InsertDML:
 			{
@@ -186,10 +185,8 @@ func (this *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesCha
 			if err != nil {
 				return err
 			}
-			//this.currentCoordinatesMutex.Lock()
 			this.currentCoordinates = mysql.NewLazyGTIDCoordinates(this.lastCommittedGTIDSet, sid, event.GNO)
 			this.currentTrxCoords = this.currentCoordinates
-			//this.currentCoordinatesMutex.Unlock()
 		case *replication.RotateEvent:
 			if this.migrationContext.UseGTIDs {
 				continue
