@@ -126,7 +126,8 @@ func (l *LazyGTIDCoordinates) Materialize() *GTIDBinlogCoordinates {
 
 	set := l.base.Clone().(*gomysql.MysqlGTIDSet)
 	set.AddGTID(l.sid, l.gno)
-	return &GTIDBinlogCoordinates{GTIDSet: set}
+	l.cachedMaterialized = &GTIDBinlogCoordinates{GTIDSet: set}
+	return l.cachedMaterialized
 }
 
 func (l *LazyGTIDCoordinates) String() string        { return l.Materialize().String() }
