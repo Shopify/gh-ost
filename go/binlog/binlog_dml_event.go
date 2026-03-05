@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/github/gh-ost/go/sql"
-	"github.com/go-mysql-org/go-mysql/replication"
 )
 
 type EventDML string
@@ -21,31 +20,6 @@ const (
 	UpdateDML EventDML = "Update"
 	DeleteDML EventDML = "Delete"
 )
-
-// ToEventDMLFromType converts a binlog EventType directly to EventDML.
-// This is more efficient than ToEventDML() as it avoids string allocation and parsing.
-func ToEventDMLFromType(eventType replication.EventType) EventDML {
-	switch eventType {
-	case replication.WRITE_ROWS_EVENTv0,
-		replication.WRITE_ROWS_EVENTv1,
-		replication.WRITE_ROWS_EVENTv2,
-		replication.MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1:
-		return InsertDML
-	case replication.UPDATE_ROWS_EVENTv0,
-		replication.UPDATE_ROWS_EVENTv1,
-		replication.UPDATE_ROWS_EVENTv2,
-		replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1,
-		replication.PARTIAL_UPDATE_ROWS_EVENT:
-		return UpdateDML
-	case replication.DELETE_ROWS_EVENTv0,
-		replication.DELETE_ROWS_EVENTv1,
-		replication.DELETE_ROWS_EVENTv2,
-		replication.MARIADB_DELETE_ROWS_COMPRESSED_EVENT_V1:
-		return DeleteDML
-	default:
-		return NotDML
-	}
-}
 
 func ToEventDML(description string) EventDML {
 	// description can be a statement (`UPDATE my_table ...`) or a RBR event name (`UpdateRowsEventV2`)
