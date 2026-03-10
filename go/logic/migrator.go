@@ -899,7 +899,7 @@ func (this *Migrator) atomicCutOver() (err error) {
 	// If we need to create triggers we need to do it here (only create part)
 	if this.migrationContext.IncludeTriggers && len(this.migrationContext.Triggers) > 0 {
 		if err := this.applier.CreateTriggersOnGhost(); err != nil {
-			this.migrationContext.Log.Errore(err)
+			return this.migrationContext.Log.Errore(err)
 		}
 	}
 
@@ -1419,7 +1419,9 @@ func (this *Migrator) initiateApplier() error {
 				return err
 			}
 		}
-		this.applier.WriteChangelogState(string(GhostTableMigrated))
+		if _, err := this.applier.WriteChangelogState(string(GhostTableMigrated)); err != nil {
+			return err
+		}
 	}
 
 	// ensure performance_schema.metadata_locks is available.
@@ -1558,6 +1560,15 @@ func (this *Migrator) iterateChunks() error {
 			if err := this.retryBatchCopyWithHooks(applyCopyRowsFunc); err != nil {
 				return terminateRowIteration(err)
 			}
+
+			// record last successfully copied range
+			this.applier.LastIterationRangeMutex.Lock()
+			if this.migrationContext.MigrationIterationRangeMinValues != nil && this.migrationContext.MigrationIterationRangeMaxValues != nil {
+				this.applier.LastIterationRangeMinValues = this.migrationContext.MigrationIterationRangeMinValues.Clone()
+				this.applier.LastIterationRangeMaxValues = this.migrationContext.MigrationIterationRangeMaxValues.Clone()
+			}
+			this.applier.LastIterationRangeMutex.Unlock()
+
 			return nil
 		}
 		// Enqueue copy operation; to be executed by executeWriteFuncs()
