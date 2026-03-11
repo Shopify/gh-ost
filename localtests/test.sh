@@ -231,6 +231,11 @@ test_single() {
         gh-ost-test-mysql-replica --default-character-set=utf8mb4 test < $tests_path/$test_name/before.sql
     fi
 
+    if [ -f $tests_path/$test_name/before.sql ]; then
+        gh-ost-test-mysql-master --default-character-set=utf8mb4 test < $tests_path/$test_name/before.sql
+        gh-ost-test-mysql-replica --default-character-set=utf8mb4 test < $tests_path/$test_name/before.sql
+    fi
+
     extra_args=""
     if [ -f $tests_path/$test_name/extra_args ]; then
         extra_args=$(cat $tests_path/$test_name/extra_args)
@@ -326,8 +331,8 @@ test_single() {
         gh-ost-test-mysql-replica --default-character-set=utf8mb4 test < $tests_path/$test_name/after.sql
     fi
 
-    if [ -f $tests_path/$test_name/destroy.sql ] ; then
-        gh-ost-test-mysql-master --default-character-set=utf8mb4 test < $tests_path/$test_name/destroy.sql
+    if [ -f $tests_path/$test_name/destroy.sql ]; then
+        gh-ost-test-mysql-master --default-character-set=utf8mb4 test <$tests_path/$test_name/destroy.sql
     fi
 
     if [ -f $tests_path/$test_name/expect_failure ]; then
