@@ -17,7 +17,7 @@ import (
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
-	uuid "github.com/google/uuid"
+	"github.com/google/uuid"
 	"golang.org/x/net/context"
 )
 
@@ -32,15 +32,15 @@ type GoMySQLReader struct {
 	// If using the file coordinates it is binlog position of the transaction's XID event.
 	LastTrxCoords mysql.BinlogCoordinates
 	// currentTrxCoords is set once per GTIDEvent and shared by all RowsEvents within
-	// the same transaction. It points to currentCoordinates (a *LazyGTIDCoordinates),
+	// the same transaction. It points to currentCoordinates (a lazy *GTIDBinlogCoordinates),
 	// which is replaced at the next GTIDEvent — so old entries retain valid references.
 	// Only accessed from within the StreamEvents goroutine; no mutex needed.
 	currentTrxCoords mysql.BinlogCoordinates
-	// lastCommittedGTIDSet is the MysqlGTIDSet from the most recently seen XIDEvent
-	// (or the initial coordinates). It is immutable once set and used as the base for
-	// LazyGTIDCoordinates so we avoid cloning the full set on each GTIDEvent.
-	// Only written from within StreamEvents; no mutex needed.
-	lastCommittedGTIDSet *gomysql.MysqlGTIDSet
+	// lastCommittedCoords is the GTIDBinlogCoordinates from the most recently seen
+	// XIDEvent (or the initial coordinates). WithPendingGTID aliases its GTIDSet as
+	// the base for each new in-flight coord, so the Clone is deferred until actually
+	// needed. Only written from within StreamEvents; no mutex needed.
+	lastCommittedCoords *mysql.GTIDBinlogCoordinates
 }
 
 func NewGoMySQLReader(migrationContext *base.MigrationContext) *GoMySQLReader {
@@ -78,7 +78,7 @@ func (this *GoMySQLReader) ConnectBinlogStreamer(coordinates mysql.BinlogCoordin
 	// Start sync with specified GTID set or binlog file and position
 	if this.migrationContext.UseGTIDs {
 		coords := coordinates.(*mysql.GTIDBinlogCoordinates)
-		this.lastCommittedGTIDSet = coords.GTIDSet
+		this.lastCommittedCoords = coords
 		this.binlogStreamer, err = this.binlogSyncer.StartSyncGTID(coords.GTIDSet)
 	} else {
 		coords := this.currentCoordinates.(*mysql.FileBinlogCoordinates)
@@ -91,8 +91,8 @@ func (this *GoMySQLReader) ConnectBinlogStreamer(coordinates mysql.BinlogCoordin
 }
 
 func (this *GoMySQLReader) GetCurrentBinlogCoordinates() mysql.BinlogCoordinates {
-	//this.currentCoordinatesMutex.Lock()
-	//defer this.currentCoordinatesMutex.Unlock()
+	this.currentCoordinatesMutex.Lock()
+	defer this.currentCoordinatesMutex.Unlock()
 	return this.currentCoordinates.Clone()
 }
 
@@ -185,8 +185,11 @@ func (this *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesCha
 			if err != nil {
 				return err
 			}
-			this.currentCoordinates = mysql.NewLazyGTIDCoordinates(this.lastCommittedGTIDSet, sid, event.GNO)
-			this.currentTrxCoords = this.currentCoordinates
+			pending := this.lastCommittedCoords.WithPendingGTID(sid, event.GNO)
+			this.currentCoordinatesMutex.Lock()
+			this.currentCoordinates = pending
+			this.currentCoordinatesMutex.Unlock()
+			this.currentTrxCoords = pending
 		case *replication.RotateEvent:
 			if this.migrationContext.UseGTIDs {
 				continue
@@ -198,14 +201,16 @@ func (this *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesCha
 			this.currentCoordinatesMutex.Unlock()
 		case *replication.XIDEvent:
 			if this.migrationContext.UseGTIDs {
-				gSet := event.GSet.(*gomysql.MysqlGTIDSet)
-				if coords, ok := this.LastTrxCoords.(*mysql.GTIDBinlogCoordinates); ok {
-					coords.GTIDSet = gSet
-					coords.UUIDSet = nil
-				} else {
-					this.LastTrxCoords = &mysql.GTIDBinlogCoordinates{GTIDSet: gSet}
-				}
-				this.lastCommittedGTIDSet = gSet
+				// go-mysql allocates a fresh MysqlGTIDSet for every XIDEvent it decodes
+				// from the binlog stream, so we can alias event.GSet directly without
+				// cloning it. The pointer is then shared by LastTrxCoords and
+				// lastCommittedCoords. lastCommittedCoords is subsequently used as the
+				// base inside WithPendingGTID: it is cloned there only if a comparison
+				// or string representation is actually requested, and never mutated.
+				// Any future code that modifies the set after this point must Clone first.
+				committed := &mysql.GTIDBinlogCoordinates{GTIDSet: event.GSet.(*gomysql.MysqlGTIDSet)}
+				this.LastTrxCoords = committed
+				this.lastCommittedCoords = committed
 			} else {
 				this.LastTrxCoords = this.currentCoordinates.Clone()
 			}

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,36 +21,41 @@ const (
 	benchRowsPerTx = 5
 )
 
-// 02b9e2cf-9c8a-11e7-a479-42010ae7009b — one of the real servers in the set
-var benchServerSID = []byte{
-	0x02, 0xb9, 0xe2, 0xcf, 0x9c, 0x8a, 0x11, 0xe7,
-	0xa4, 0x79, 0x42, 0x01, 0x0a, 0xe7, 0x00, 0x9b,
-}
+const benchNumUUIDs = 182
 
-func loadProductionGTIDSet(tb testing.TB) *gomysql.MysqlGTIDSet {
-	data, err := os.ReadFile("../../gtid_executed_shard21")
-	if err != nil {
-		tb.Fatalf("could not load gtid_executed_shard21: %v", err)
+// benchServerSID is a fixed synthetic UUID used as the "active" server in benchmarks.
+var benchServerSID = guuid.MustParse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+// buildSyntheticGTIDSet generates a realistic-sized GTID set with numUUIDs unique
+// server UUIDs, each with a transaction range of 1 to a varying upper bound.
+func buildSyntheticGTIDSet(numUUIDs int) *gomysql.MysqlGTIDSet {
+	set := new(gomysql.MysqlGTIDSet)
+	set.Sets = make(map[string]*gomysql.UUIDSet)
+	for i := 0; i < numUUIDs; i++ {
+		// Deterministic UUIDs seeded from index
+		sid := guuid.MustParse(fmt.Sprintf("%08x-0000-4000-8000-%012x", i, i))
+		gno := int64(1_000_000 + i*100_000)
+		uuidSet := gomysql.NewUUIDSet(sid, gomysql.Interval{Start: 1, Stop: gno + 1})
+		set.Sets[sid.String()] = uuidSet
 	}
-	cleaned := strings.Join(strings.Fields(string(data)), ",")
-	set, err := gomysql.ParseMysqlGTIDSet(cleaned)
-	if err != nil {
-		tb.Fatalf("could not parse GTID set: %v", err)
-	}
-	return set.(*gomysql.MysqlGTIDSet)
+	// Include the benchmark server UUID so the initial set size stays consistent
+	// throughout the benchmark (no extra map entry created on first AddSet).
+	set.Sets[benchServerSID.String()] = gomysql.NewUUIDSet(benchServerSID, gomysql.Interval{Start: 1, Stop: 2})
+	return set
 }
 
 func buildGTIDEvents(initialSet *gomysql.MysqlGTIDSet) []*replication.BinlogEvent {
 	events := make([]*replication.BinlogEvent, 0, benchTxCount*(benchRowsPerTx+2))
 	accSet := initialSet.Clone().(*gomysql.MysqlGTIDSet)
-	sid, _ := guuid.FromBytes(benchServerSID)
+	sid := benchServerSID
+	sidBytes, _ := sid.MarshalBinary()
 
 	for i := 0; i < benchTxCount; i++ {
-		gno := int64(73_590_714 + i)
+		gno := int64(i + 1)
 
 		events = append(events, &replication.BinlogEvent{
 			Header: &replication.EventHeader{EventType: replication.GTID_EVENT},
-			Event:  &replication.GTIDEvent{SID: benchServerSID, GNO: gno},
+			Event:  &replication.GTIDEvent{SID: sidBytes, GNO: gno},
 		})
 
 		for r := 0; r < benchRowsPerTx; r++ {
@@ -154,6 +158,9 @@ func feedAndRun(b *testing.B, label string, useGTIDs bool, events []*replication
 			currentCoordinates:      initialCoords.Clone(),
 			binlogStreamer:          s,
 		}
+		if useGTIDs {
+			reader.lastCommittedCoords = initialCoords.(*mysql.GTIDBinlogCoordinates)
+		}
 		entriesCh := make(chan *BinlogEntry, 100)
 
 		// Feed events concurrently so AddEventToStreamer never blocks.
@@ -188,10 +195,10 @@ func feedAndRun(b *testing.B, label string, useGTIDs bool, events []*replication
 }
 
 func BenchmarkStreamingGTID(b *testing.B) {
-	initialSet := loadProductionGTIDSet(b)
+	initialSet := buildSyntheticGTIDSet(benchNumUUIDs)
 	events := buildGTIDEvents(initialSet)
 	initialCoords := &mysql.GTIDBinlogCoordinates{GTIDSet: initialSet}
-	feedAndRun(b, "GTID (182 UUIDs)", true, events, initialCoords)
+	feedAndRun(b, fmt.Sprintf("GTID (%d UUIDs)", benchNumUUIDs), true, events, initialCoords)
 }
 
 func BenchmarkStreamingFile(b *testing.B) {
