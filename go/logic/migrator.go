@@ -87,17 +87,12 @@ type Migrator struct {
 	hooksExecutor    *HooksExecutor
 	migrationContext *base.MigrationContext
 
-	firstThrottlingCollected     chan bool
-	ghostTableMigrated           chan bool
-	rowCopyComplete              chan error
-	rowCountComplete             chan error
-	rowCountVerificationComplete chan error
-	allEventsUpToLockProcessed   chan *lockProcessedStruct
-	lastLockProcessed            *lockProcessedStruct
-
-	rowCopyCompleteFlag              int64
-	rowCountCompleteFlag             int64
-	rowCountVerificationCompleteFlag int64
+	firstThrottlingCollected   chan bool
+	ghostTableMigrated         chan bool
+	rowCopyComplete            chan error
+	allEventsUpToLockProcessed chan *lockProcessedStruct
+	lastLockProcessed          *lockProcessedStruct
+	rowCopyCompleteFlag        int64
 
 	// copyRowsQueue should not be buffered; if buffered some non-damaging but
 	//  excessive work happens at the end of the iteration as new copy-jobs arrive before realizing the copy is complete
@@ -109,19 +104,17 @@ type Migrator struct {
 
 func NewMigrator(context *base.MigrationContext, appVersion string) *Migrator {
 	migrator := &Migrator{
-		appVersion:                   appVersion,
-		hooksExecutor:                NewHooksExecutor(context),
-		migrationContext:             context,
-		parser:                       sql.NewAlterTableParser(),
-		ghostTableMigrated:           make(chan bool),
-		firstThrottlingCollected:     make(chan bool, 3),
-		rowCopyComplete:              make(chan error),
-		rowCountVerificationComplete: make(chan error),
-		allEventsUpToLockProcessed:   make(chan *lockProcessedStruct),
-
-		copyRowsQueue:     make(chan tableWriteFunc),
-		applyEventsQueue:  make(chan *applyEventStruct, base.MaxEventsBatchSize),
-		finishedMigrating: 0,
+		appVersion:                 appVersion,
+		hooksExecutor:              NewHooksExecutor(context),
+		migrationContext:           context,
+		parser:                     sql.NewAlterTableParser(),
+		ghostTableMigrated:         make(chan bool),
+		firstThrottlingCollected:   make(chan bool, 3),
+		rowCopyComplete:            make(chan error),
+		allEventsUpToLockProcessed: make(chan *lockProcessedStruct),
+		copyRowsQueue:              make(chan tableWriteFunc),
+		applyEventsQueue:           make(chan *applyEventStruct, base.MaxEventsBatchSize),
+		finishedMigrating:          0,
 	}
 	return migrator
 }
@@ -212,38 +205,6 @@ func (this *Migrator) consumeRowCopyComplete() {
 	this.migrationContext.MarkRowCopyEndTime()
 	go func() {
 		for err := range this.rowCopyComplete {
-			if err != nil {
-				this.migrationContext.PanicAbort <- err
-			}
-		}
-	}()
-}
-
-// consumeRowCountComplete blocks on the rowCountComplete channel once, and then
-// consumes and drops any further incoming events that may be left hanging.
-func (this *Migrator) consumeRowCountComplete() {
-	if err := <-this.rowCountComplete; err != nil {
-		this.migrationContext.PanicAbort <- err
-	}
-	atomic.StoreInt64(&this.rowCountCompleteFlag, 1)
-	go func() {
-		for err := range this.rowCountComplete {
-			if err != nil {
-				this.migrationContext.PanicAbort <- err
-			}
-		}
-	}()
-}
-
-// consumeRowCountVerificationComplete blocks on the rowCountVerificationComplete channel once,
-// and then consumes and drops any further incoming events that may be left hanging.
-func (this *Migrator) consumeRowCountVerificationComplete() {
-	if err := <-this.rowCountVerificationComplete; err != nil {
-		this.migrationContext.PanicAbort <- err
-	}
-	atomic.StoreInt64(&this.rowCountVerificationCompleteFlag, 1)
-	go func() {
-		for err := range this.rowCountVerificationComplete {
 			if err != nil {
 				this.migrationContext.PanicAbort <- err
 			}
@@ -352,13 +313,11 @@ func (this *Migrator) countTableRows() (err error) {
 
 	countRowsFunc := func(ctx context.Context) error {
 		if err := this.inspector.CountTableRows(ctx); err != nil {
-			this.rowCountComplete <- err
 			return err
 		}
 		if err := this.hooksExecutor.onRowCountComplete(); err != nil {
 			return err
 		}
-		this.rowCountComplete <- nil
 		return nil
 	}
 
@@ -537,11 +496,6 @@ func (this *Migrator) Migrate() (err error) {
 		return err
 	}
 	this.printStatus(ForcePrintStatusRule)
-
-	if this.migrationContext.VerifyRowCountBeforeCutOver {
-		go this.waitForRowCountAndVerify()
-		this.consumeRowCountVerificationComplete()
-	}
 
 	if this.migrationContext.IsCountingTableRows() {
 		this.migrationContext.Log.Info("stopping query for exact row count, because that can accidentally lock out the cut over")
@@ -1437,51 +1391,6 @@ func (this *Migrator) initiateApplier() error {
 
 	go this.applier.InitiateHeartbeat()
 	return nil
-}
-
-func (this *Migrator) waitForRowCountAndVerify() error {
-	this.migrationContext.Log.Debugf("Verifying row count")
-	terminateRowCountVerification := func(err error) error {
-		this.rowCountVerificationComplete <- err
-		return this.migrationContext.Log.Errore(err)
-	}
-	if this.migrationContext.Noop {
-		this.migrationContext.Log.Debugf("Noop operation; not verifying row count")
-		return terminateRowCountVerification(nil)
-	}
-	if this.migrationContext.MigrationRangeMinValues == nil {
-		this.migrationContext.Log.Debugf("No rows found in table. Nothing to verify")
-		return terminateRowCountVerification(nil)
-	}
-
-	if this.migrationContext.IsCountingTableRows() {
-		this.migrationContext.Log.Debugf("Waiting for row count to complete")
-		this.consumeRowCountComplete()
-	}
-
-	this.migrationContext.Log.Debugf("Row count complete")
-
-	if this.migrationContext.UsedRowsEstimateMethod != base.CountRowsEstimate {
-		return terminateRowCountVerification(fmt.Errorf("Row count verification failed. UsedRowsEstimateMethod is %s", this.migrationContext.UsedRowsEstimateMethod))
-	}
-
-	error := this.verifyRowCount()
-
-	return terminateRowCountVerification(error)
-}
-
-func (this *Migrator) verifyRowCount() error {
-	rowsCopied := this.migrationContext.GetTotalRowsCopied()
-	rowsEstimate := atomic.LoadInt64(&this.migrationContext.RowsEstimate)
-	accuracy := this.migrationContext.VerifyRowCountBeforeCutOverAccuracy
-	percentageDiff := int64(math.Round(math.Abs(float64(rowsCopied-rowsEstimate)) / float64(rowsEstimate) * 100))
-
-	if percentageDiff > accuracy {
-		return fmt.Errorf("Row count verification failed. Expected %d rows, but got %d (%d%% difference exceeds allowed %d%%)", rowsEstimate, rowsCopied, percentageDiff, accuracy)
-	} else {
-		this.migrationContext.Log.Debugf("Row count verification successful. Expected %d rows, but got %d (%d%% difference, allowed %d%%)", rowsEstimate, rowsCopied, percentageDiff, accuracy)
-		return nil
-	}
 }
 
 // iterateChunks iterates the existing table rows, and generates a copy task of

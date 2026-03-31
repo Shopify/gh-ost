@@ -89,9 +89,6 @@ func main() {
 	flag.BoolVar(&migrationContext.AzureMySQL, "azure", false, "set to 'true' when you execute on Azure Database on MySQL.")
 	flag.BoolVar(&migrationContext.UseGTIDs, "gtid", false, "(experimental) set to 'true' to use MySQL GTIDs for binlog positioning.")
 
-	flag.BoolVar(&migrationContext.VerifyRowCountBeforeCutOver, "verify-rowcount-before-cut-over", false, "(with --exact-rowcount), verifies before cut-over that copied rows match the row count")
-	flag.Int64Var(&migrationContext.VerifyRowCountBeforeCutOverAccuracy, "verify-rowcount-before-cut-over-accuracy", 2, "percentage accuracy for verifying row count before cut-over. I.e. how far do we allow the internal row count estimate to be off the actual copied rows")
-
 	executeFlag := flag.Bool("execute", false, "actually execute the alter & migrate the table. Default is noop: do some tests and exit")
 	flag.BoolVar(&migrationContext.TestOnReplica, "test-on-replica", false, "Have the migration run on a replica, not on the master. At the end of migration replication is stopped, and tables are swapped and immediately swap-revert. Replication remains stopped and you can compare the two tables for building trust")
 	flag.BoolVar(&migrationContext.TestOnReplicaSkipReplicaStop, "test-on-replica-skip-replica-stop", false, "When --test-on-replica is enabled, do not issue commands stop replication (requires --test-on-replica)")
@@ -370,10 +367,6 @@ func main() {
 	}
 	if err := migrationContext.SetExponentialBackoffMaxInterval(*exponentialBackoffMaxInterval); err != nil {
 		migrationContext.Log.Errore(err)
-	}
-
-	if !migrationContext.CountTableRows && migrationContext.VerifyRowCountBeforeCutOver {
-		migrationContext.Log.Fatalf("--verify-rowcount-before-cut-over cannot be used without --exact-rowcount")
 	}
 
 	log.Infof("starting gh-ost %+v (git commit: %s)", AppVersion, GitCommit)

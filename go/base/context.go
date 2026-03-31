@@ -158,8 +158,6 @@ type MigrationContext struct {
 	PanicOnWarnings                     bool
 	Checkpoint                          bool
 	CheckpointIntervalSeconds           int64
-	VerifyRowCountBeforeCutOver         bool
-	VerifyRowCountBeforeCutOverAccuracy int64
 
 	DropServeSocket bool
 	ServeSocketFile string

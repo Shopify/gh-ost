@@ -296,7 +296,6 @@ test_single() {
     --storage-engine=${storage_engine} \
     --alter='engine=${storage_engine}' \
     --exact-rowcount \
-    --verify-rowcount-before-cut-over \
     --assume-rbr \
     --skip-metadata-lock-check \
     --initially-drop-old-table \
