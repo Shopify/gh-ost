@@ -153,7 +153,7 @@ func (this *EventsStreamer) readCurrentBinlogCoordinates() error {
 			if err != nil {
 				return err
 			}
-			this.initialBinlogCoordinates = &mysql.GTIDBinlogCoordinates{GTIDSet: gtidSet.(*gomysql.MysqlGTIDSet)}
+			this.initialBinlogCoordinates = mysql.NewGTIDBinlogCoordinatesFromSet(gtidSet.(*gomysql.MysqlGTIDSet))
 		} else {
 			this.initialBinlogCoordinates = &mysql.FileBinlogCoordinates{
 				LogFile: m.GetString("File"),

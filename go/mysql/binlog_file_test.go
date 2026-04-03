@@ -48,14 +48,14 @@ func TestBinlogCoordinates(t *testing.T) {
 48e2bc1d-d66d-11e8-bf56-a0369f9437b8:1,
 492e2980-4518-11e9-92c6-e4434b3eca94:1-4926754399`)
 
-	c5 := GTIDBinlogCoordinates{GTIDSet: gtidSet1.(*gomysql.MysqlGTIDSet)}
-	c6 := GTIDBinlogCoordinates{GTIDSet: gtidSet1.(*gomysql.MysqlGTIDSet)}
-	c7 := GTIDBinlogCoordinates{GTIDSet: gtidSet2.(*gomysql.MysqlGTIDSet)}
-	c8 := GTIDBinlogCoordinates{GTIDSet: gtidSet3.(*gomysql.MysqlGTIDSet)}
-	c9 := GTIDBinlogCoordinates{GTIDSet: gtidSetBig1.(*gomysql.MysqlGTIDSet)}
-	c10 := GTIDBinlogCoordinates{GTIDSet: gtidSetBig2.(*gomysql.MysqlGTIDSet)}
+	c5 := NewGTIDBinlogCoordinatesFromSet(gtidSet1.(*gomysql.MysqlGTIDSet))
+	c6 := NewGTIDBinlogCoordinatesFromSet(gtidSet1.(*gomysql.MysqlGTIDSet))
+	c7 := NewGTIDBinlogCoordinatesFromSet(gtidSet2.(*gomysql.MysqlGTIDSet))
+	c8 := NewGTIDBinlogCoordinatesFromSet(gtidSet3.(*gomysql.MysqlGTIDSet))
+	c9 := NewGTIDBinlogCoordinatesFromSet(gtidSetBig1.(*gomysql.MysqlGTIDSet))
+	c10 := NewGTIDBinlogCoordinatesFromSet(gtidSetBig2.(*gomysql.MysqlGTIDSet))
 
-	require.True(t, c5.Equals(&c6))
+	require.True(t, c5.Equals(c6))
 	require.True(t, c1.Equals(&c2))
 	require.False(t, c1.Equals(&c3))
 	require.False(t, c1.Equals(&c4))
@@ -70,10 +70,10 @@ func TestBinlogCoordinates(t *testing.T) {
 	require.True(t, c1.SmallerThanOrEquals(&c3))
 	require.True(t, c1.SmallerThanOrEquals(&c2))
 	require.True(t, c1.SmallerThanOrEquals(&c3))
-	require.True(t, c6.SmallerThanOrEquals(&c7))
-	require.True(t, c7.SmallerThanOrEquals(&c8))
-	require.True(t, c9.SmallerThanOrEquals(&c9))
-	require.True(t, c9.SmallerThanOrEquals(&c10))
+	require.True(t, c6.SmallerThanOrEquals(c7))
+	require.True(t, c7.SmallerThanOrEquals(c8))
+	require.True(t, c9.SmallerThanOrEquals(c9))
+	require.True(t, c9.SmallerThanOrEquals(c10))
 }
 
 func TestBinlogCoordinatesAsKey(t *testing.T) {

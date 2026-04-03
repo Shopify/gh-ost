@@ -79,7 +79,7 @@ func (this *GoMySQLReader) ConnectBinlogStreamer(coordinates mysql.BinlogCoordin
 	if this.migrationContext.UseGTIDs {
 		coords := coordinates.(*mysql.GTIDBinlogCoordinates)
 		this.lastCommittedCoords = coords
-		this.binlogStreamer, err = this.binlogSyncer.StartSyncGTID(coords.GTIDSet)
+		this.binlogStreamer, err = this.binlogSyncer.StartSyncGTID(coords.GTIDSet())
 	} else {
 		coords := this.currentCoordinates.(*mysql.FileBinlogCoordinates)
 		this.binlogStreamer, err = this.binlogSyncer.StartSync(gomysql.Position{
@@ -109,7 +109,6 @@ func (this *GoMySQLReader) handleRowsEvent(ev *replication.BinlogEvent, rowsEven
 		return fmt.Errorf("Unknown DML type: %v", ev.Header.EventType)
 	}
 
-	// Convert schema and table names once per RowsEvent, not per row
 	schemaName := string(rowsEvent.Table.Schema)
 	tableName := string(rowsEvent.Table.Table)
 
@@ -201,14 +200,10 @@ func (this *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesCha
 			this.currentCoordinatesMutex.Unlock()
 		case *replication.XIDEvent:
 			if this.migrationContext.UseGTIDs {
-				// go-mysql allocates a fresh MysqlGTIDSet for every XIDEvent it decodes
-				// from the binlog stream, so we can alias event.GSet directly without
-				// cloning it. The pointer is then shared by LastTrxCoords and
-				// lastCommittedCoords. lastCommittedCoords is subsequently used as the
-				// base inside WithPendingGTID: it is cloned there only if a comparison
-				// or string representation is actually requested, and never mutated.
-				// Any future code that modifies the set after this point must Clone first.
-				committed := &mysql.GTIDBinlogCoordinates{GTIDSet: event.GSet.(*gomysql.MysqlGTIDSet)}
+				// go-mysql allocates a fresh MysqlGTIDSet for every XIDEvent, so we can
+				// alias event.GSet directly. gtidSet is unexported; mutation from outside
+				// the mysql package is not possible.
+				committed := mysql.NewGTIDBinlogCoordinatesFromSet(event.GSet.(*gomysql.MysqlGTIDSet))
 				this.LastTrxCoords = committed
 				this.lastCommittedCoords = committed
 			} else {

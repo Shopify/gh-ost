@@ -197,7 +197,7 @@ func feedAndRun(b *testing.B, label string, useGTIDs bool, events []*replication
 func BenchmarkStreamingGTID(b *testing.B) {
 	initialSet := buildSyntheticGTIDSet(benchNumUUIDs)
 	events := buildGTIDEvents(initialSet)
-	initialCoords := &mysql.GTIDBinlogCoordinates{GTIDSet: initialSet}
+	initialCoords := mysql.NewGTIDBinlogCoordinatesFromSet(initialSet)
 	feedAndRun(b, fmt.Sprintf("GTID (%d UUIDs)", benchNumUUIDs), true, events, initialCoords)
 }
 
