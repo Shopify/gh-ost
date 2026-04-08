@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net/url"
@@ -19,7 +20,11 @@ import (
 	"github.com/github/gh-ost/go/sql"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/openark/golib/log"
-
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 	"golang.org/x/term"
 )
 
@@ -148,6 +153,7 @@ func main() {
 	flag.BoolVar(&migrationContext.IncludeTriggers, "include-triggers", false, "When true, the triggers (if exist) will be created on the new table")
 	flag.StringVar(&migrationContext.TriggerSuffix, "trigger-suffix", "", "Add a suffix to the trigger name (i.e '_v2'). Requires '--include-triggers'")
 	flag.BoolVar(&migrationContext.RemoveTriggerSuffix, "remove-trigger-suffix-if-exists", false, "Remove given suffix from name of trigger. Requires '--include-triggers' and '--trigger-suffix'")
+	enableTracing := flag.Bool("enable-tracing", false, "Enable OpenTelemetry tracing. Requires OTEL_EXPORTER_OTLP_ENDPOINT to be set.")
 	flag.BoolVar(&migrationContext.SkipPortValidation, "skip-port-validation", false, "Skip port validation for MySQL connections")
 	flag.BoolVar(&migrationContext.Checkpoint, "checkpoint", false, "Enable migration checkpoints")
 	flag.Int64Var(&migrationContext.CheckpointIntervalSeconds, "checkpoint-seconds", 300, "The number of seconds between checkpoints")
@@ -379,12 +385,39 @@ func main() {
 	log.Infof("starting gh-ost %+v (git commit: %s)", AppVersion, GitCommit)
 	acceptSignals(migrationContext)
 
+	ctx := context.Background()
+
+	if *enableTracing {
+		exporter, otelErr := otlptracegrpc.New(ctx,
+			otlptracegrpc.WithInsecure(),
+		)
+		if otelErr != nil {
+			migrationContext.Log.Warningf("Failed to create OTel exporter: %v", otelErr)
+		} else {
+			tp := sdktrace.NewTracerProvider(
+				sdktrace.WithSampler(sdktrace.AlwaysSample()),
+				sdktrace.WithBatcher(exporter),
+				sdktrace.WithResource(resource.NewWithAttributes(
+					semconv.SchemaURL,
+					semconv.ServiceName("gh-ost"),
+					semconv.ServiceVersion(AppVersion),
+				)),
+			)
+			otel.SetTracerProvider(tp)
+			defer func() {
+				if shutdownErr := tp.Shutdown(ctx); shutdownErr != nil {
+					migrationContext.Log.Warningf("Failed to shutdown OTel provider: %v", shutdownErr)
+				}
+			}()
+		}
+	}
+
 	migrator := logic.NewMigrator(migrationContext, AppVersion)
 	var err error
 	if migrationContext.Revert {
-		err = migrator.Revert()
+		err = migrator.Revert(ctx)
 	} else {
-		err = migrator.Migrate()
+		err = migrator.Migrate(ctx)
 	}
 
 	if err != nil {

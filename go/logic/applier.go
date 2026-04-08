@@ -27,12 +27,25 @@ import (
 	"github.com/github/gh-ost/go/mysql"
 	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/openark/golib/sqlutils"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
 	GhostChangelogTableComment = "gh-ost changelog"
 	atomicCutOverMagicHint     = "ghost-cut-over-sentry"
 )
+
+func endSpan(span trace.Span, err *error) {
+	if *err != nil {
+		span.RecordError(*err)
+		span.SetStatus(codes.Error, (*err).Error())
+	}
+	span.End()
+}
 
 // ErrNoCheckpointFound is returned when an empty checkpoint table is queried.
 var ErrNoCheckpointFound = errors.New("no checkpoint found in _ghk table")
@@ -71,6 +84,7 @@ type Applier struct {
 	migrationContext  *base.MigrationContext
 	finishedMigrating int64
 	name              string
+	tracer            trace.Tracer
 
 	CurrentCoordinatesMutex sync.Mutex
 	CurrentCoordinates      mysql.BinlogCoordinates
@@ -91,6 +105,7 @@ func NewApplier(migrationContext *base.MigrationContext) *Applier {
 		migrationContext:  migrationContext,
 		finishedMigrating: 0,
 		name:              "applier",
+		tracer:            otel.Tracer("gh-ost"),
 	}
 }
 
@@ -1469,9 +1484,8 @@ func (this *Applier) buildDMLEventQuery(dmlEvent *binlog.BinlogDMLEvent) []*dmlB
 }
 
 // ApplyDMLEventQueries applies multiple DML queries onto the _ghost_ table
-func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) error {
+func (this *Applier) ApplyDMLEventQueries(ctx context.Context, dmlEvents [](*binlog.BinlogDMLEvent)) error {
 	var totalDelta int64
-	ctx := context.Background()
 
 	err := func() error {
 		conn, err := this.db.Conn(ctx)
@@ -1495,54 +1509,69 @@ func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) 
 			return err
 		}
 
-		buildResults := make([]*dmlBuildResult, 0, len(dmlEvents))
-		nArgs := 0
-		for _, dmlEvent := range dmlEvents {
-			for _, buildResult := range this.buildDMLEventQuery(dmlEvent) {
-				if buildResult.err != nil {
-					return rollback(buildResult.err)
+		// Build DML queries
+		buildResults, nArgs, buildErr := func() (_ []*dmlBuildResult, _ int, err error) {
+			_, buildSpan := this.tracer.Start(ctx, "gh-ost.dml.build_queries")
+			defer endSpan(buildSpan, &err)
+
+			results := make([]*dmlBuildResult, 0, len(dmlEvents))
+			n := 0
+			for _, dmlEvent := range dmlEvents {
+				for _, buildResult := range this.buildDMLEventQuery(dmlEvent) {
+					if buildResult.err != nil {
+						return nil, 0, buildResult.err
+					}
+					n += len(buildResult.args)
+					results = append(results, buildResult)
 				}
-				nArgs += len(buildResult.args)
-				buildResults = append(buildResults, buildResult)
 			}
+			buildSpan.SetAttributes(attribute.Int("gh_ost.query_count", len(results)))
+			return results, n, nil
+		}()
+		if buildErr != nil {
+			return rollback(buildErr)
 		}
 
 		// We batch together the DML queries into multi-statements to minimize network trips.
 		// We have to use the raw driver connection to access the rows affected
 		// for each statement in the multi-statement.
-		execErr := conn.Raw(func(driverConn any) error {
-			ex := driverConn.(driver.ExecerContext)
-			nvc := driverConn.(driver.NamedValueChecker)
+		execErr := func() (err error) {
+			_, execSpan := this.tracer.Start(ctx, "gh-ost.dml.execute")
+			defer endSpan(execSpan, &err)
+			execSpan.SetAttributes(attribute.Int("gh_ost.statements", len(buildResults)))
 
-			multiArgs := make([]driver.NamedValue, 0, nArgs)
-			multiQueryBuilder := strings.Builder{}
-			for _, buildResult := range buildResults {
-				for _, arg := range buildResult.args {
-					nv := driver.NamedValue{Value: driver.Value(arg)}
-					nvc.CheckNamedValue(&nv)
-					multiArgs = append(multiArgs, nv)
+			return conn.Raw(func(driverConn any) error {
+				ex := driverConn.(driver.ExecerContext)
+				nvc := driverConn.(driver.NamedValueChecker)
+
+				multiArgs := make([]driver.NamedValue, 0, nArgs)
+				multiQueryBuilder := strings.Builder{}
+				for _, buildResult := range buildResults {
+					for _, arg := range buildResult.args {
+						nv := driver.NamedValue{Value: driver.Value(arg)}
+						nvc.CheckNamedValue(&nv)
+						multiArgs = append(multiArgs, nv)
+					}
+
+					multiQueryBuilder.WriteString(buildResult.query)
+					multiQueryBuilder.WriteString(";\n")
 				}
 
-				multiQueryBuilder.WriteString(buildResult.query)
-				multiQueryBuilder.WriteString(";\n")
-			}
+				res, err := ex.ExecContext(ctx, multiQueryBuilder.String(), multiArgs)
+				if err != nil {
+					return fmt.Errorf("%w; query=%s; args=%+v", err, multiQueryBuilder.String(), multiArgs)
+				}
 
-			res, err := ex.ExecContext(ctx, multiQueryBuilder.String(), multiArgs)
-			if err != nil {
-				err = fmt.Errorf("%w; query=%s; args=%+v", err, multiQueryBuilder.String(), multiArgs)
-				return err
-			}
+				mysqlRes := res.(drivermysql.Result)
 
-			mysqlRes := res.(drivermysql.Result)
-
-			// each DML is either a single insert (delta +1), update (delta +0) or delete (delta -1).
-			// multiplying by the rows actually affected (either 0 or 1) will give an accurate row delta for this DML event
-			for i, rowsAffected := range mysqlRes.AllRowsAffected() {
-				totalDelta += buildResults[i].rowsDelta * rowsAffected
-			}
-			return nil
-		})
-
+				// each DML is either a single insert (delta +1), update (delta +0) or delete (delta -1).
+				// multiplying by the rows actually affected (either 0 or 1) will give an accurate row delta for this DML event
+				for i, rowsAffected := range mysqlRes.AllRowsAffected() {
+					totalDelta += buildResults[i].rowsDelta * rowsAffected
+				}
+				return nil
+			})
+		}()
 		if execErr != nil {
 			return rollback(execErr)
 		}
@@ -1583,9 +1612,15 @@ func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) 
 			}
 		}
 
-		if err := tx.Commit(); err != nil {
-			return err
+		commitErr := func() (err error) {
+			_, commitSpan := this.tracer.Start(ctx, "gh-ost.dml.commit")
+			defer endSpan(commitSpan, &err)
+			return tx.Commit()
+		}()
+		if commitErr != nil {
+			return commitErr
 		}
+
 		return nil
 	}()
 

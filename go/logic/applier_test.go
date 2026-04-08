@@ -16,6 +16,10 @@ import (
 
 	"github.com/testcontainers/testcontainers-go"
 	testmysql "github.com/testcontainers/testcontainers-go/modules/mysql"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"fmt"
 
@@ -319,7 +323,7 @@ func (suite *ApplierTestSuite) TestApplyDMLEventQueries() {
 			NewColumnValues: sql.ToColumnValues([]interface{}{123456, 42}),
 		},
 	}
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().NoError(err)
 
 	// Check that the row was inserted
@@ -341,6 +345,78 @@ func (suite *ApplierTestSuite) TestApplyDMLEventQueries() {
 
 	suite.Require().Equal(int64(1), migrationContext.TotalDMLEventsApplied)
 	suite.Require().Equal(int64(0), migrationContext.RowsDeltaEstimate)
+}
+
+func (suite *ApplierTestSuite) TestApplyDMLEventQueriesTracing() {
+	ctx := context.Background()
+
+	// Set up span recorder
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	prevTP := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	defer otel.SetTracerProvider(prevTP)
+
+	_, err := suite.db.ExecContext(ctx, fmt.Sprintf("CREATE TABLE %s (id INT, item_id INT);", getTestTableName()))
+	suite.Require().NoError(err)
+	_, err = suite.db.ExecContext(ctx, fmt.Sprintf("CREATE TABLE %s (id INT, item_id INT);", getTestGhostTableName()))
+	suite.Require().NoError(err)
+
+	connectionConfig, err := getTestConnectionConfig(ctx, suite.mysqlContainer)
+	suite.Require().NoError(err)
+
+	migrationContext := newTestMigrationContext()
+	migrationContext.ApplierConnectionConfig = connectionConfig
+	migrationContext.SetConnectionConfig("innodb")
+	migrationContext.OriginalTableColumns = sql.NewColumnList([]string{"id", "item_id"})
+	migrationContext.SharedColumns = sql.NewColumnList([]string{"id", "item_id"})
+	migrationContext.MappedSharedColumns = sql.NewColumnList([]string{"id", "item_id"})
+	migrationContext.UniqueKey = &sql.UniqueKey{
+		Name:    "primary_key",
+		Columns: *sql.NewColumnList([]string{"id"}),
+	}
+
+	applier := NewApplier(migrationContext)
+	suite.Require().NoError(applier.prepareQueries())
+	defer applier.Teardown()
+	suite.Require().NoError(applier.InitDBConnections())
+
+	dmlEvents := []*binlog.BinlogDMLEvent{
+		{
+			DatabaseName:    testMysqlDatabase,
+			TableName:       testMysqlTableName,
+			DML:             binlog.InsertDML,
+			NewColumnValues: sql.ToColumnValues([]interface{}{1, 10}),
+		},
+		{
+			DatabaseName:    testMysqlDatabase,
+			TableName:       testMysqlTableName,
+			DML:             binlog.InsertDML,
+			NewColumnValues: sql.ToColumnValues([]interface{}{2, 20}),
+		},
+	}
+
+	err = applier.ApplyDMLEventQueries(ctx, dmlEvents)
+	suite.Require().NoError(err)
+
+	// Collect spans
+	spans := sr.Ended()
+	spansByName := make(map[string]sdktrace.ReadOnlySpan)
+	for _, s := range spans {
+		if strings.HasPrefix(s.Name(), "gh-ost.dml.") {
+			spansByName[s.Name()] = s
+		}
+	}
+
+	// Verify all 3 inner spans exist
+	suite.Require().Contains(spansByName, "gh-ost.dml.build_queries", "missing build_queries span")
+	suite.Require().Contains(spansByName, "gh-ost.dml.execute", "missing execute span")
+	suite.Require().Contains(spansByName, "gh-ost.dml.commit", "missing commit span")
+
+	// Verify none errored (success leaves status as Unset)
+	for name, s := range spansByName {
+		suite.Assert().NotEqualf(codes.Error, s.Status().Code, "span %q has Error status: %s", name, s.Status().Description)
+	}
 }
 
 func (suite *ApplierTestSuite) TestValidateOrDropExistingTables() {
@@ -534,7 +610,7 @@ func (suite *ApplierTestSuite) TestPanicOnWarningsInApplyIterationInsertQuerySuc
 			NewColumnValues: sql.ToColumnValues([]interface{}{123456, 42}),
 		},
 	}
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().NoError(err)
 
 	err = applier.CreateChangelogTable()
@@ -778,7 +854,7 @@ func (suite *ApplierTestSuite) TestPanicOnWarningsWithDuplicateKeyOnNonMigration
 	}
 
 	// This should return an error when PanicOnWarnings is enabled
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().Error(err)
 	suite.Require().Contains(err.Error(), "Duplicate entry")
 
@@ -872,7 +948,7 @@ func (suite *ApplierTestSuite) TestUpdateModifyingUniqueKeyWithDuplicateOnOtherI
 	suite.Require().Len(buildResults, 2, "UPDATE modifying unique key should be converted to DELETE+INSERT")
 
 	// Apply the event - this should FAIL because INSERT will have duplicate email warning
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().Error(err, "Should fail when DELETE+INSERT causes duplicate on non-migration unique key")
 	suite.Require().Contains(err.Error(), "Duplicate entry", "Error should mention duplicate entry")
 
@@ -961,7 +1037,7 @@ func (suite *ApplierTestSuite) TestNormalUpdateWithPanicOnWarnings() {
 	suite.Require().Len(buildResults, 1, "Normal UPDATE should generate single UPDATE query")
 
 	// Apply the event - should succeed
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().NoError(err)
 
 	// Verify the update was applied correctly

@@ -24,6 +24,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	testmysql "github.com/testcontainers/testcontainers-go/modules/mysql"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"runtime"
 
@@ -363,7 +368,7 @@ func (suite *MigratorTestSuite) TestMigrateEmpty() {
 
 	migrator := NewMigrator(migrationContext, "0.0.0")
 
-	err = migrator.Migrate()
+	err = migrator.Migrate(context.Background())
 	suite.Require().NoError(err)
 
 	// Verify the new column was added
@@ -477,7 +482,7 @@ echo "[gh-ost-on-batch-copy-retry]: Done, exiting..."
 
 	migrator := NewMigrator(migrationContext, "0.0.0")
 
-	err = migrator.Migrate()
+	err = migrator.Migrate(context.Background())
 	suite.Require().NoError(err)
 
 	wOut.Close()
@@ -747,7 +752,7 @@ func (suite *MigratorTestSuite) TestCutOverLossDataCaseLockGhostBeforeRename() {
 		migrator := NewMigrator(migrationContext, "0.0.0")
 
 		//nolint:contextcheck
-		done <- migrator.Migrate()
+		done <- migrator.Migrate(context.Background())
 	}()
 
 	time.Sleep(2 * time.Second)
@@ -821,7 +826,7 @@ func (suite *MigratorTestSuite) TestRevertEmpty() {
 
 		migrator := NewMigrator(migrationContext, "0.0.0")
 
-		err = migrator.Migrate()
+		err = migrator.Migrate(context.Background())
 		oldTableName = migrationContext.GetOldTableName()
 		suite.Require().NoError(err)
 	}
@@ -840,7 +845,7 @@ func (suite *MigratorTestSuite) TestRevertEmpty() {
 
 		migrator := NewMigrator(migrationContext, "0.0.0")
 
-		err = migrator.Revert()
+		err = migrator.Revert(context.Background())
 		suite.Require().NoError(err)
 	}
 }
@@ -878,7 +883,7 @@ func (suite *MigratorTestSuite) TestRevert() {
 
 		migrator := NewMigrator(migrationContext, "0.0.0")
 
-		err = migrator.Migrate()
+		err = migrator.Migrate(context.Background())
 		oldTableName = migrationContext.GetOldTableName()
 		suite.Require().NoError(err)
 	}
@@ -909,7 +914,7 @@ func (suite *MigratorTestSuite) TestRevert() {
 
 		migrator := NewMigrator(migrationContext, "0.0.0")
 
-		err = migrator.Revert()
+		err = migrator.Revert(context.Background())
 		oldTableName = migrationContext.GetOldTableName()
 		suite.Require().NoError(err)
 	}
@@ -926,6 +931,84 @@ func (suite *MigratorTestSuite) TestRevert() {
 	suite.Require().NoError(rows.Err())
 
 	suite.Require().Equal(checksum1, checksum2)
+}
+
+func (suite *MigratorTestSuite) TestMigrateTracing() {
+	ctx := context.Background()
+
+	// Set up in-memory span recorder as global tracer provider
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	prevTP := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	defer otel.SetTracerProvider(prevTP)
+
+	// Create test table with data
+	_, err := suite.db.ExecContext(ctx, fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY, name VARCHAR(64))", getTestTableName()))
+	suite.Require().NoError(err)
+	_, err = suite.db.ExecContext(ctx, fmt.Sprintf("INSERT INTO %s VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')", getTestTableName()))
+	suite.Require().NoError(err)
+
+	connectionConfig, err := getTestConnectionConfig(ctx, suite.mysqlContainer)
+	suite.Require().NoError(err)
+
+	migrationContext := newTestMigrationContext()
+	migrationContext.ApplierConnectionConfig = connectionConfig
+	migrationContext.InspectorConnectionConfig = connectionConfig
+	migrationContext.SetConnectionConfig("innodb")
+	migrationContext.InitiallyDropOldTable = true
+	migrationContext.AlterStatementOptions = "ADD COLUMN foobar varchar(255), ENGINE=InnoDB"
+
+	migrator := NewMigrator(migrationContext, "0.0.0")
+
+	err = migrator.Migrate(ctx)
+	suite.Require().NoError(err)
+
+	// Wait briefly for async spans to end
+	time.Sleep(500 * time.Millisecond)
+
+	// Collect ended spans
+	spans := sr.Ended()
+
+	// Build map of span names for lookup
+	spansByName := make(map[string][]sdktrace.ReadOnlySpan)
+	for _, s := range spans {
+		spansByName[s.Name()] = append(spansByName[s.Name()], s)
+	}
+
+	// Verify expected spans exist
+	suite.Require().NotEmpty(spansByName["gh-ost.binlog.connect"], "expected gh-ost.binlog.connect span")
+	suite.Require().NotEmpty(spansByName["gh-ost.row_copy.chunk"], "expected gh-ost.row_copy.chunk span")
+	suite.Require().NotEmpty(spansByName["gh-ost.cut_over"], "expected gh-ost.cut_over span")
+
+	// Verify row_copy.chunk span has expected attributes
+	chunkAttrs := spansByName["gh-ost.row_copy.chunk"][0].Attributes()
+	suite.Require().True(hasAttribute(chunkAttrs, "gh_ost.rows_affected"), "missing gh_ost.rows_affected")
+	suite.Require().True(hasAttribute(chunkAttrs, "gh_ost.chunk_size"), "missing gh_ost.chunk_size")
+	suite.Require().True(hasAttribute(chunkAttrs, "gh_ost.iteration"), "missing gh_ost.iteration")
+	suite.Require().True(hasAttribute(chunkAttrs, "gh_ost.total_rows_copied"), "missing gh_ost.total_rows_copied")
+
+	// Verify cut_over span has expected attributes
+	cutOverAttrs := spansByName["gh-ost.cut_over"][0].Attributes()
+	suite.Require().True(hasAttribute(cutOverAttrs, "gh_ost.cut_over_type"), "missing gh_ost.cut_over_type")
+	suite.Require().True(hasAttribute(cutOverAttrs, "gh_ost.table"), "missing gh_ost.table")
+
+	// Verify no gh-ost spans have error status
+	for _, s := range spans {
+		if strings.HasPrefix(s.Name(), "gh-ost.") {
+			suite.Assert().NotEqualf(codes.Error, s.Status().Code, "span %q has Error status: %s", s.Name(), s.Status().Description)
+		}
+	}
+}
+
+// hasAttribute checks if a span's attributes contain a key with the given name.
+func hasAttribute(attrs []attribute.KeyValue, key string) bool {
+	for _, a := range attrs {
+		if string(a.Key) == key {
+			return true
+		}
+	}
+	return false
 }
 
 func TestMigrator(t *testing.T) {

@@ -20,6 +20,10 @@ import (
 	"github.com/github/gh-ost/go/binlog"
 	"github.com/github/gh-ost/go/mysql"
 	"github.com/github/gh-ost/go/sql"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -77,6 +81,7 @@ const (
 
 // Migrator is the main schema migration flow manager.
 type Migrator struct {
+	ctx              context.Context
 	appVersion       string
 	parser           *sql.AlterTableParser
 	inspector        *Inspector
@@ -105,6 +110,8 @@ type Migrator struct {
 	applyEventsQueue chan *applyEventStruct
 
 	finishedMigrating int64
+
+	tracer trace.Tracer
 }
 
 func NewMigrator(context *base.MigrationContext, appVersion string) *Migrator {
@@ -122,6 +129,7 @@ func NewMigrator(context *base.MigrationContext, appVersion string) *Migrator {
 		copyRowsQueue:     make(chan tableWriteFunc),
 		applyEventsQueue:  make(chan *applyEventStruct, base.MaxEventsBatchSize),
 		finishedMigrating: 0,
+		tracer:            otel.Tracer("gh-ost"),
 	}
 	return migrator
 }
@@ -389,7 +397,8 @@ func (this *Migrator) createFlagFiles() (err error) {
 }
 
 // Migrate executes the complete migration logic. This is *the* major gh-ost function.
-func (this *Migrator) Migrate() (err error) {
+func (this *Migrator) Migrate(ctx context.Context) (err error) {
+	this.ctx = ctx
 	this.migrationContext.Log.Infof("Migrating %s.%s", sql.EscapeName(this.migrationContext.DatabaseName), sql.EscapeName(this.migrationContext.OriginalTableName))
 	this.migrationContext.StartTime = time.Now()
 	if this.migrationContext.Hostname, err = os.Hostname(); err != nil {
@@ -583,7 +592,8 @@ func (this *Migrator) Migrate() (err error) {
 // Revert reverts a migration that previously completed by applying all DML events that happened
 // after the original cutover, then doing another cutover to swap the tables back.
 // The steps are similar to Migrate(), but without row copying.
-func (this *Migrator) Revert() error {
+func (this *Migrator) Revert(ctx context.Context) error {
+	this.ctx = ctx
 	this.migrationContext.Log.Infof("Reverting %s.%s from %s.%s",
 		sql.EscapeName(this.migrationContext.DatabaseName), sql.EscapeName(this.migrationContext.OriginalTableName),
 		sql.EscapeName(this.migrationContext.DatabaseName), sql.EscapeName(this.migrationContext.OldTableName))
@@ -773,16 +783,25 @@ func (this *Migrator) cutOver() (err error) {
 		}
 	}
 
+	_, cutOverSpan := this.tracer.Start(this.ctx, "gh-ost.cut_over")
+	cutOverSpan.SetAttributes(
+		attribute.String("gh_ost.table", this.migrationContext.OriginalTableName),
+	)
+
 	switch this.migrationContext.CutOverType {
 	case base.CutOverAtomic:
 		// Atomic solution: we use low timeout and multiple attempts. But for
 		// each failed attempt, we throttle until replication lag is back to normal
+		cutOverSpan.SetAttributes(attribute.String("gh_ost.cut_over_type", "atomic"))
 		err = this.atomicCutOver()
 	case base.CutOverTwoStep:
+		cutOverSpan.SetAttributes(attribute.String("gh_ost.cut_over_type", "two-step"))
 		err = this.cutOverTwoStep()
 	default:
+		endSpan(cutOverSpan, &err)
 		return this.migrationContext.Log.Fatalf("Unknown cut-over type: %d; should never get here!", this.migrationContext.CutOverType)
 	}
+	endSpan(cutOverSpan, &err)
 	this.handleCutOverResult(err)
 	return err
 }
@@ -1322,7 +1341,11 @@ func (this *Migrator) printStatus(rule PrintStatusRule, writers ...io.Writer) {
 // initiateStreaming begins streaming of binary log events and registers listeners for such events
 func (this *Migrator) initiateStreaming() error {
 	this.eventsStreamer = NewEventsStreamer(this.migrationContext)
-	if err := this.eventsStreamer.InitDBConnections(); err != nil {
+	if err := func() (err error) {
+		_, connectSpan := this.tracer.Start(this.ctx, "gh-ost.binlog.connect")
+		defer endSpan(connectSpan, &err)
+		return this.eventsStreamer.InitDBConnections()
+	}(); err != nil {
 		return err
 	}
 	this.eventsStreamer.AddListener(
@@ -1538,9 +1561,24 @@ func (this *Migrator) iterateChunks() error {
 					// _ghost_ table, which no longer exists. So, bothering error messages and all, but no damage.
 					return nil
 				}
-				_, rowsAffected, _, err := this.applier.ApplyIterationInsertQuery()
-				if err != nil {
-					return err // wrapping call will retry
+				rowsAffected, chunkErr := func() (_ int64, err error) {
+					_, chunkSpan := this.tracer.Start(this.ctx, "gh-ost.row_copy.chunk")
+					defer endSpan(chunkSpan, &err)
+
+					_, rowsAffected, _, err := this.applier.ApplyIterationInsertQuery()
+					if err != nil {
+						return 0, err
+					}
+					chunkSpan.SetAttributes(
+						attribute.Int64("gh_ost.rows_affected", rowsAffected),
+						attribute.Int64("gh_ost.chunk_size", atomic.LoadInt64(&this.migrationContext.ChunkSize)),
+						attribute.Int64("gh_ost.iteration", atomic.LoadInt64(&this.migrationContext.Iteration)),
+						attribute.Int64("gh_ost.total_rows_copied", atomic.LoadInt64(&this.migrationContext.TotalRowsCopied)+rowsAffected),
+					)
+					return rowsAffected, nil
+				}()
+				if chunkErr != nil {
+					return chunkErr // wrapping call will retry
 				}
 
 				if this.migrationContext.PanicOnWarnings {
@@ -1609,11 +1647,21 @@ func (this *Migrator) onApplyEventStruct(eventStruct *applyEventStruct) error {
 			}
 			dmlEvents = append(dmlEvents, additionalStruct.dmlEvent)
 		}
-		// Create a task to apply the DML event; this will be execute by executeWriteFuncs()
-		var applyEventFunc tableWriteFunc = func() error {
-			return this.applier.ApplyDMLEventQueries(dmlEvents)
-		}
-		if err := this.retryOperation(applyEventFunc); err != nil {
+
+		if err := func() (err error) {
+			dmlCtx, dmlSpan := this.tracer.Start(this.ctx, "gh-ost.binlog.apply_dml_events")
+			defer endSpan(dmlSpan, &err)
+			var applyEventFunc tableWriteFunc = func() error {
+				return this.applier.ApplyDMLEventQueries(dmlCtx, dmlEvents)
+			}
+			if err := this.retryOperation(applyEventFunc); err != nil {
+				return err
+			}
+			dmlSpan.SetAttributes(
+				attribute.Int64("gh_ost.total_dml_events_applied", atomic.LoadInt64(&this.migrationContext.TotalDMLEventsApplied)),
+			)
+			return nil
+		}(); err != nil {
 			return this.migrationContext.Log.Errore(err)
 		}
 		// update applier coordinates
