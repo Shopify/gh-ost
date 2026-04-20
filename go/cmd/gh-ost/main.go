@@ -13,9 +13,11 @@ import (
 	"os/signal"
 	"regexp"
 	"syscall"
+	"time"
 
 	"github.com/github/gh-ost/go/base"
 	"github.com/github/gh-ost/go/logic"
+	"github.com/github/gh-ost/go/metrics"
 	"github.com/github/gh-ost/go/sql"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/openark/golib/log"
@@ -156,6 +158,10 @@ func main() {
 	criticalLoad := flag.String("critical-load", "", "Comma delimited status-name=threshold, same format as --max-load. When status exceeds threshold, app panics and quits")
 	flag.Int64Var(&migrationContext.CriticalLoadIntervalMilliseconds, "critical-load-interval-millis", 0, "When 0, migration immediately bails out upon meeting critical-load. When non-zero, a second check is done after given interval, and migration only bails out if 2nd check still meets critical load")
 	flag.Int64Var(&migrationContext.CriticalLoadHibernateSeconds, "critical-load-hibernate-seconds", 0, "When non-zero, critical-load does not panic and bail out; instead, gh-ost goes into hibernation for the specified duration. It will not read/write anything from/to any server")
+	statsdAddress := flag.String("statsd-address", "", "DogStatsD address (host:port, or unix socket per DataDog client); when set, emit Go runtime metrics on an interval")
+	statsdPrefix := flag.String("statsd-prefix", "gh_ost.", "metric namespace for DogStatsD (use with --statsd-address)")
+	statsdIntervalMillis := flag.Int64("statsd-interval-millis", 10000, "emit interval for Go runtime metrics when --statsd-address is set")
+
 	quiet := flag.Bool("quiet", false, "quiet")
 	verbose := flag.Bool("verbose", false, "verbose")
 	debug := flag.Bool("debug", false, "debug mode (very verbose)")
@@ -374,6 +380,13 @@ func main() {
 
 	log.Infof("starting gh-ost %+v (git commit: %s)", AppVersion, GitCommit)
 	acceptSignals(migrationContext)
+
+	metricsClient, metricsErr := metrics.NewClient(*statsdAddress, *statsdPrefix, nil)
+	if metricsErr != nil {
+		log.Fatalf("metrics: %v", metricsErr)
+	}
+	migrationContext.Metrics = metricsClient
+	metrics.StartRuntimeReporter(migrationContext.GetContext(), metricsClient, time.Duration(*statsdIntervalMillis)*time.Millisecond)
 
 	migrator := logic.NewMigrator(migrationContext, AppVersion)
 	var err error
