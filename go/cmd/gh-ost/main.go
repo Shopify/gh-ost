@@ -13,9 +13,11 @@ import (
 	"os/signal"
 	"regexp"
 	"syscall"
+	"time"
 
 	"github.com/github/gh-ost/go/base"
 	"github.com/github/gh-ost/go/logic"
+	"github.com/github/gh-ost/go/metrics"
 	"github.com/github/gh-ost/go/sql"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/openark/golib/log"
@@ -24,6 +26,20 @@ import (
 )
 
 var AppVersion, GitCommit string
+
+type statsdTagList []string
+
+func (s *statsdTagList) String() string {
+	if s == nil || len(*s) == 0 {
+		return ""
+	}
+	return fmt.Sprint([]string(*s))
+}
+
+func (s *statsdTagList) Set(value string) error {
+	*s = append(*s, value)
+	return nil
+}
 
 // acceptSignals registers for OS signals
 func acceptSignals(migrationContext *base.MigrationContext) {
@@ -88,9 +104,6 @@ func main() {
 	flag.BoolVar(&migrationContext.GoogleCloudPlatform, "gcp", false, "set to 'true' when you execute on a 1st generation Google Cloud Platform (GCP).")
 	flag.BoolVar(&migrationContext.AzureMySQL, "azure", false, "set to 'true' when you execute on Azure Database on MySQL.")
 	flag.BoolVar(&migrationContext.UseGTIDs, "gtid", false, "(experimental) set to 'true' to use MySQL GTIDs for binlog positioning.")
-
-	flag.BoolVar(&migrationContext.VerifyRowCountBeforeCutOver, "verify-rowcount-before-cut-over", false, "(with --exact-rowcount), verifies before cut-over that copied rows match the row count")
-	flag.Int64Var(&migrationContext.VerifyRowCountBeforeCutOverAccuracy, "verify-rowcount-before-cut-over-accuracy", 2, "percentage accuracy for verifying row count before cut-over. I.e. how far do we allow the internal row count estimate to be off the actual copied rows")
 
 	executeFlag := flag.Bool("execute", false, "actually execute the alter & migrate the table. Default is noop: do some tests and exit")
 	flag.BoolVar(&migrationContext.TestOnReplica, "test-on-replica", false, "Have the migration run on a replica, not on the master. At the end of migration replication is stopped, and tables are swapped and immediately swap-revert. Replication remains stopped and you can compare the two tables for building trust")
@@ -159,6 +172,10 @@ func main() {
 	criticalLoad := flag.String("critical-load", "", "Comma delimited status-name=threshold, same format as --max-load. When status exceeds threshold, app panics and quits")
 	flag.Int64Var(&migrationContext.CriticalLoadIntervalMilliseconds, "critical-load-interval-millis", 0, "When 0, migration immediately bails out upon meeting critical-load. When non-zero, a second check is done after given interval, and migration only bails out if 2nd check still meets critical load")
 	flag.Int64Var(&migrationContext.CriticalLoadHibernateSeconds, "critical-load-hibernate-seconds", 0, "When non-zero, critical-load does not panic and bail out; instead, gh-ost goes into hibernation for the specified duration. It will not read/write anything from/to any server")
+	statsdAddr := flag.String("statsd-addr", "", "StatsD endpoint (host:port or unix socket); empty disables StatsD")
+	var statsdTags statsdTagList
+	flag.Var(&statsdTags, "statsd-tags", "global StatsD tags applied to every metric (repeatable), format key:value. Example: --statsd-tags 'env:prod,service:my-service'")
+	runtimeMetricsInterval := flag.Int("runtime-metrics-interval", 10, "Seconds between Go runtime memory/GC gauge samples (requires --statsd-addr); 0 disables")
 	quiet := flag.Bool("quiet", false, "quiet")
 	verbose := flag.Bool("verbose", false, "verbose")
 	debug := flag.Bool("debug", false, "debug mode (very verbose)")
@@ -319,6 +336,9 @@ func main() {
 	if migrationContext.CheckpointIntervalSeconds < 10 {
 		migrationContext.Log.Fatalf("--checkpoint-seconds should be >=10")
 	}
+	if migrationContext.CountTableRows && migrationContext.PanicOnWarnings {
+		migrationContext.Log.Warning("--exact-rowcount with --panic-on-warnings: row counts cannot be exact due to warning detection")
+	}
 
 	switch *cutOver {
 	case "atomic", "default", "":
@@ -372,12 +392,19 @@ func main() {
 		migrationContext.Log.Errore(err)
 	}
 
-	if !migrationContext.CountTableRows && migrationContext.VerifyRowCountBeforeCutOver {
-		migrationContext.Log.Fatalf("--verify-rowcount-before-cut-over cannot be used without --exact-rowcount")
-	}
-
 	log.Infof("starting gh-ost %+v (git commit: %s)", AppVersion, GitCommit)
 	acceptSignals(migrationContext)
+
+	metricsClient, metricsErr := metrics.NewClient(*statsdAddr, []string(statsdTags), "gh_ost.")
+	if metricsErr != nil {
+		log.Fatalf("metrics: %v", metricsErr)
+	}
+	defer func() { _ = metricsClient.Close() }()
+	migrationContext.Metrics = metricsClient
+	metricsClient.Count("startup", 1)
+	if *runtimeMetricsInterval > 0 {
+		metrics.StartGoRuntimeReporter(migrationContext.GetContext(), metricsClient, time.Duration(*runtimeMetricsInterval)*time.Second)
+	}
 
 	migrator := logic.NewMigrator(migrationContext, AppVersion)
 	var err error
