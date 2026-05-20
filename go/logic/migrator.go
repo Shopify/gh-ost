@@ -331,16 +331,6 @@ func (mgtr *Migrator) onChangelogHeartbeatEvent(dmlEntry *binlog.BinlogEntry) (e
 
 	// Route the coords bump through applyEventsQueue so it is ordered after
 	// any DMLs the streamer enqueued before this heartbeat.
-	//
-	// If we instead mutated applier.CurrentCoordinates directly from this
-	// streamer goroutine, the checkpoint loop (Migrator.Checkpoint) could
-	// observe coords that include DMLs still sitting un-applied in
-	// applyEventsQueue and write a checkpoint row whose LastTrxCoords is
-	// AHEAD of what has actually been applied to the ghost table. If gh-ost
-	// then crashes before the queue drains, resume reads that checkpoint and
-	// calls StartSyncGTID with the persisted set; MySQL treats the un-applied
-	// GTIDs as already-seen and never re-streams them, so the ghost table
-	// silently loses those DMLs and cut-over produces a stale table.
 	coords := dmlEntry.Coordinates
 	var writeFunc tableWriteFunc = func() error {
 		mgtr.applier.CurrentCoordinatesMutex.Lock()
