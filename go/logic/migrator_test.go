@@ -410,26 +410,13 @@ func TestMigratorGetMigrationStateAndETA(t *testing.T) {
 type progressGaugeSpy struct {
 	names  []string
 	values []float64
+	tags   [][]string
 }
 
-func (s *progressGaugeSpy) Gauge(name string, value float64, _ ...string) {
+func (s *progressGaugeSpy) Gauge(name string, value float64, tags ...string) {
 	s.names = append(s.names, name)
 	s.values = append(s.values, value)
-}
-
-func (s *progressGaugeSpy) Histogram(string, float64, ...string) {}
-
-type statusMetricsSpy struct {
-	progressGaugeSpy
-	histogramNames  []string
-	histogramValues []float64
-	histogramTags   [][]string
-}
-
-func (s *statusMetricsSpy) Histogram(name string, value float64, tags ...string) {
-	s.histogramNames = append(s.histogramNames, name)
-	s.histogramValues = append(s.histogramValues, value)
-	s.histogramTags = append(s.histogramTags, append([]string(nil), tags...))
+	s.tags = append(s.tags, append([]string(nil), tags...))
 }
 
 func TestReportStatusEmitsProgressGaugesEveryTick(t *testing.T) {
@@ -442,7 +429,7 @@ func TestReportStatusEmitsProgressGaugesEveryTick(t *testing.T) {
 
 	migrator := NewMigrator(ctx, "test")
 	migrator.reportStatus(NoPrintStatusRule, io.Discard)
-	require.Len(t, spy.names, 6)
+	require.Len(t, spy.names, 8)
 	assert.Equal(t, []string{
 		"row_copy.rows_copied",
 		"row_copy.rows_estimate",
@@ -450,16 +437,18 @@ func TestReportStatusEmitsProgressGaugesEveryTick(t *testing.T) {
 		"binlog.backlog_size",
 		"binlog.backlog_capacity",
 		"binlog.backlog_utilization",
+		"lag.replication_seconds",
+		"lag.heartbeat_seconds",
 	}, spy.names)
-	assert.Equal(t, []float64{1000, 5000, 42, 0, float64(cap(migrator.applyEventsQueue)), 0}, spy.values)
+	assert.Equal(t, []float64{1000, 5000, 42, 0, float64(cap(migrator.applyEventsQueue)), 0}, spy.values[:6])
 	assert.InDelta(t, 20.0, ctx.GetProgressPct(), 0.01)
 
 	spy.names = nil
 	spy.values = nil
 	atomic.StoreInt64(&ctx.TotalDMLEventsApplied, 100)
 	migrator.reportStatus(NoPrintStatusRule, io.Discard)
-	require.Len(t, spy.names, 6)
-	assert.Equal(t, []float64{1000, 5000, 100, 0, float64(cap(migrator.applyEventsQueue)), 0}, spy.values)
+	require.Len(t, spy.names, 8)
+	assert.Equal(t, []float64{1000, 5000, 100, 0, float64(cap(migrator.applyEventsQueue)), 0}, spy.values[:6])
 }
 
 func TestReportStatusEmitsBinlogBacklogGauges(t *testing.T) {
@@ -478,7 +467,7 @@ func TestReportStatusEmitsBinlogBacklogGauges(t *testing.T) {
 	migrator.reportStatus(NoPrintStatusRule, io.Discard)
 
 	capacity := float64(cap(migrator.applyEventsQueue))
-	require.Len(t, spy.names, 6)
+	require.Len(t, spy.names, 8)
 	assert.Equal(t, float64(2), spy.values[3])
 	assert.Equal(t, capacity, spy.values[4])
 	assert.InDelta(t, 2/capacity, spy.values[5], 1e-9)
@@ -495,7 +484,7 @@ func TestReportStatusEmitsGaugesWhenRowCopyComplete(t *testing.T) {
 	atomic.StoreInt64(&migrator.rowCopyCompleteFlag, 1)
 	migrator.reportStatus(NoPrintStatusRule, io.Discard)
 
-	require.Len(t, spy.names, 6)
+	require.Len(t, spy.names, 8)
 	assert.Equal(t, float64(5000), spy.values[0])
 	assert.Equal(t, float64(5000), spy.values[1], "rows_estimate tracks rows_copied when row copy is complete")
 }
@@ -515,31 +504,12 @@ func TestReportStatusEmitsGaugesWhenPrintSuppressed(t *testing.T) {
 	require.False(t, migrator.shouldPrintStatus(HeuristicPrintStatusRule, snap.elapsedSeconds, etaDuration))
 
 	migrator.reportStatus(HeuristicPrintStatusRule, io.Discard)
-	require.Len(t, spy.names, 6)
-	assert.Equal(t, []float64{1000, 5000, 0, 0, float64(cap(migrator.applyEventsQueue)), 0}, spy.values)
+	require.Len(t, spy.names, 8)
+	assert.Equal(t, []float64{1000, 5000, 0, 0, float64(cap(migrator.applyEventsQueue)), 0}, spy.values[:6])
 }
 
-func TestReportStatusEmitsLagHistogramsWhenNotThrottled(t *testing.T) {
-	spy := &statusMetricsSpy{}
-	ctx := base.NewMigrationContext()
-	ctx.Metrics = spy
-	atomic.StoreInt64(&ctx.CurrentLag, int64(3*time.Second))
-	ctx.SetLastHeartbeatOnChangelogTime(time.Now().Add(-2 * time.Second))
-
-	migrator := NewMigrator(ctx, "test")
-	migrator.reportStatus(NoPrintStatusRule, io.Discard)
-
-	require.Len(t, spy.histogramNames, 2)
-	assert.Equal(t, []string{"lag.replication_seconds", "lag.heartbeat_seconds"}, spy.histogramNames)
-	assert.InDelta(t, 3.0, spy.histogramValues[0], 0.01)
-	assert.InDelta(t, 2.0, spy.histogramValues[1], 0.5)
-	require.Len(t, spy.histogramTags[0], 1)
-	assert.Equal(t, "throttled:false", spy.histogramTags[0][0])
-	assert.Equal(t, "throttled:false", spy.histogramTags[1][0])
-}
-
-func TestReportStatusEmitsLagHistogramsWhenThrottled(t *testing.T) {
-	spy := &statusMetricsSpy{}
+func TestReportStatusEmitsLagGaugesWhenThrottled(t *testing.T) {
+	spy := &progressGaugeSpy{}
 	ctx := base.NewMigrationContext()
 	ctx.Metrics = spy
 	ctx.SetThrottled(true, "max-lag-millis", base.NoThrottleReasonHint)
@@ -549,9 +519,12 @@ func TestReportStatusEmitsLagHistogramsWhenThrottled(t *testing.T) {
 	migrator := NewMigrator(ctx, "test")
 	migrator.reportStatus(NoPrintStatusRule, io.Discard)
 
-	require.Len(t, spy.histogramNames, 2)
-	assert.Equal(t, "throttled:true", spy.histogramTags[0][0])
-	assert.Equal(t, "throttled:true", spy.histogramTags[1][0])
+	require.GreaterOrEqual(t, len(spy.names), 8)
+	assert.Equal(t, "lag.replication_seconds", spy.names[6])
+	assert.Equal(t, "lag.heartbeat_seconds", spy.names[7])
+	require.Len(t, spy.tags[6], 1)
+	assert.Equal(t, "throttled:true", spy.tags[6][0])
+	assert.Equal(t, "throttled:true", spy.tags[7][0])
 }
 
 func TestMigratorShouldPrintStatus(t *testing.T) {

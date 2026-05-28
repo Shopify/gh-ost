@@ -7,28 +7,16 @@ package metrics
 
 import "testing"
 
-type histogramSpy struct {
-	names  []string
-	values []float64
-	tags   [][]string
-}
-
-func (s *histogramSpy) Histogram(name string, value float64, tags ...string) {
-	s.names = append(s.names, name)
-	s.values = append(s.values, value)
-	s.tags = append(s.tags, append([]string(nil), tags...))
-}
-
-func TestEmitLagHistograms_notThrottled(t *testing.T) {
-	spy := &histogramSpy{}
-	EmitLagHistograms(spy, 2.5, 1.25, false)
+func TestEmitLagGauges_notThrottled(t *testing.T) {
+	spy := &gaugeSpy{}
+	EmitLagGauges(spy, 2.5, 1.25, false)
 
 	wantNames := []string{"lag.replication_seconds", "lag.heartbeat_seconds"}
 	wantVals := []float64{2.5, 1.25}
 	wantTags := []string{"throttled:false"}
 
-	if len(spy.names) != 2 {
-		t.Fatalf("got %d histograms, want 2", len(spy.names))
+	if len(spy.names) != len(wantNames) {
+		t.Fatalf("got %d gauges, want %d", len(spy.names), len(wantNames))
 	}
 	for i := range wantNames {
 		if spy.names[i] != wantNames[i] || spy.values[i] != wantVals[i] {
@@ -40,12 +28,12 @@ func TestEmitLagHistograms_notThrottled(t *testing.T) {
 	}
 }
 
-func TestEmitLagHistograms_throttled(t *testing.T) {
-	spy := &histogramSpy{}
-	EmitLagHistograms(spy, 4.0, 3.0, true)
+func TestEmitLagGauges_throttled(t *testing.T) {
+	spy := &gaugeSpy{}
+	EmitLagGauges(spy, 4.0, 3.0, true)
 
 	if len(spy.names) != 2 {
-		t.Fatalf("got %d histograms, want 2", len(spy.names))
+		t.Fatalf("got %d gauges, want 2", len(spy.names))
 	}
 	for i := range spy.names {
 		if len(spy.tags[i]) != 1 || spy.tags[i][0] != "throttled:true" {
@@ -54,6 +42,6 @@ func TestEmitLagHistograms_throttled(t *testing.T) {
 	}
 }
 
-func TestEmitLagHistograms_nilSafe(t *testing.T) {
-	EmitLagHistograms(nil, 1, 2, false)
+func TestEmitLagGauges_nilSafe(t *testing.T) {
+	EmitLagGauges(nil, 1, 2, false)
 }

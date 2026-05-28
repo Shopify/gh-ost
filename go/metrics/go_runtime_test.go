@@ -15,11 +15,13 @@ import (
 type gaugeSpy struct {
 	names  []string
 	values []float64
+	tags   [][]string
 }
 
-func (g *gaugeSpy) Gauge(name string, value float64, _ ...string) {
+func (g *gaugeSpy) Gauge(name string, value float64, tags ...string) {
 	g.names = append(g.names, name)
 	g.values = append(g.values, value)
+	g.tags = append(g.tags, append([]string(nil), tags...))
 }
 
 func TestEmitGoRuntimeGauges(t *testing.T) {

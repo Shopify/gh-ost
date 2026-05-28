@@ -7,13 +7,17 @@ package metrics
 
 import "fmt"
 
-// EmitLagHistograms emits replication and heartbeat lag histograms (namespace is applied by the client):
+// EmitLagGauges emits replication and heartbeat lag gauges (namespace is applied by the client):
 // gh_ost.lag.replication_seconds, gh_ost.lag.heartbeat_seconds, each tagged throttled:true|false.
-func EmitLagHistograms(emit HistogramEmitter, replicationLagSeconds, heartbeatLagSeconds float64, throttled bool) {
+//
+// These are point-in-time readings each status tick (not a distribution), so gauges are used
+// rather than histograms — DogStatsD histogram aggregation exposes count/max series that do not
+// match the log line lag values in Prometheus/Grafana.
+func EmitLagGauges(emit MemStatsGaugeEmitter, replicationLagSeconds, heartbeatLagSeconds float64, throttled bool) {
 	if emit == nil {
 		return
 	}
 	tags := []string{fmt.Sprintf("throttled:%t", throttled)}
-	emit.Histogram("lag.replication_seconds", replicationLagSeconds, tags...)
-	emit.Histogram("lag.heartbeat_seconds", heartbeatLagSeconds, tags...)
+	emit.Gauge("lag.replication_seconds", replicationLagSeconds, tags...)
+	emit.Gauge("lag.heartbeat_seconds", heartbeatLagSeconds, tags...)
 }

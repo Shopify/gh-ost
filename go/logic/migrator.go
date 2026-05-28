@@ -1182,7 +1182,7 @@ func (mgtr *Migrator) emitProgressMetrics(snap migrationProgressSnapshot) {
 		snap.applyEventsCapacity,
 	)
 	isThrottled, _, _ := mgtr.migrationContext.IsThrottled()
-	metrics.EmitLagHistograms(
+	metrics.EmitLagGauges(
 		mgtr.migrationContext.Metrics,
 		snap.replicationLagSeconds,
 		snap.heartbeatLagSeconds,

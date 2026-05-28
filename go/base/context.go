@@ -238,7 +238,7 @@ type MigrationContext struct {
 	AbortError error
 	abortMutex *sync.Mutex
 
-	Metrics metrics.Emitter
+	Metrics metrics.MemStatsGaugeEmitter
 
 	OriginalTableColumnsOnApplier    *sql.ColumnList
 	OriginalTableColumns             *sql.ColumnList
