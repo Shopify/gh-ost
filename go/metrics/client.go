@@ -21,6 +21,22 @@ type Client struct {
 	sd *statsd.Client
 }
 
+// MemStatsGaugeEmitter is implemented by *Client; used for tests without UDP.
+type MemStatsGaugeEmitter interface {
+	Gauge(name string, value float64, tags ...string)
+}
+
+// HistogramEmitter is implemented by *Client; used for tests without UDP.
+type HistogramEmitter interface {
+	Histogram(name string, value float64, tags ...string)
+}
+
+// Emitter combines gauge and histogram emission for migration status metrics.
+type Emitter interface {
+	MemStatsGaugeEmitter
+	HistogramEmitter
+}
+
 // NewClient connects to addr for StatsD. If addr is empty, returns Noop and nil error.
 // namespace is typically "gh_ost." (metrics are named namespace + short name, e.g. gh_ost.startup).
 // tags are global tags applied to every metric (repeatable --statsd-tags).
@@ -58,6 +74,13 @@ func (c *Client) Count(name string, value int64, tags ...string) {
 		return
 	}
 	_ = c.sd.Count(name, value, tags, 1.0)
+}
+
+func (c *Client) Histogram(name string, value float64, tags ...string) {
+	if c.sd == nil {
+		return
+	}
+	_ = c.sd.Histogram(name, value, tags, 1.0)
 }
 
 // Close flushes buffered metrics; safe for Noop.

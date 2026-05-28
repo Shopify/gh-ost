@@ -417,6 +417,21 @@ func (s *progressGaugeSpy) Gauge(name string, value float64, _ ...string) {
 	s.values = append(s.values, value)
 }
 
+func (s *progressGaugeSpy) Histogram(string, float64, ...string) {}
+
+type statusMetricsSpy struct {
+	progressGaugeSpy
+	histogramNames  []string
+	histogramValues []float64
+	histogramTags   [][]string
+}
+
+func (s *statusMetricsSpy) Histogram(name string, value float64, tags ...string) {
+	s.histogramNames = append(s.histogramNames, name)
+	s.histogramValues = append(s.histogramValues, value)
+	s.histogramTags = append(s.histogramTags, append([]string(nil), tags...))
+}
+
 func TestReportStatusEmitsProgressGaugesEveryTick(t *testing.T) {
 	spy := &progressGaugeSpy{}
 	ctx := base.NewMigrationContext()
@@ -502,6 +517,41 @@ func TestReportStatusEmitsGaugesWhenPrintSuppressed(t *testing.T) {
 	migrator.reportStatus(HeuristicPrintStatusRule, io.Discard)
 	require.Len(t, spy.names, 6)
 	assert.Equal(t, []float64{1000, 5000, 0, 0, float64(cap(migrator.applyEventsQueue)), 0}, spy.values)
+}
+
+func TestReportStatusEmitsLagHistogramsWhenNotThrottled(t *testing.T) {
+	spy := &statusMetricsSpy{}
+	ctx := base.NewMigrationContext()
+	ctx.Metrics = spy
+	atomic.StoreInt64(&ctx.CurrentLag, int64(3*time.Second))
+	ctx.SetLastHeartbeatOnChangelogTime(time.Now().Add(-2 * time.Second))
+
+	migrator := NewMigrator(ctx, "test")
+	migrator.reportStatus(NoPrintStatusRule, io.Discard)
+
+	require.Len(t, spy.histogramNames, 2)
+	assert.Equal(t, []string{"lag.replication_seconds", "lag.heartbeat_seconds"}, spy.histogramNames)
+	assert.InDelta(t, 3.0, spy.histogramValues[0], 0.01)
+	assert.InDelta(t, 2.0, spy.histogramValues[1], 0.5)
+	require.Len(t, spy.histogramTags[0], 1)
+	assert.Equal(t, "throttled:false", spy.histogramTags[0][0])
+	assert.Equal(t, "throttled:false", spy.histogramTags[1][0])
+}
+
+func TestReportStatusEmitsLagHistogramsWhenThrottled(t *testing.T) {
+	spy := &statusMetricsSpy{}
+	ctx := base.NewMigrationContext()
+	ctx.Metrics = spy
+	ctx.SetThrottled(true, "max-lag-millis", base.NoThrottleReasonHint)
+	atomic.StoreInt64(&ctx.CurrentLag, int64(5*time.Second))
+	ctx.SetLastHeartbeatOnChangelogTime(time.Now().Add(-4 * time.Second))
+
+	migrator := NewMigrator(ctx, "test")
+	migrator.reportStatus(NoPrintStatusRule, io.Discard)
+
+	require.Len(t, spy.histogramNames, 2)
+	assert.Equal(t, "throttled:true", spy.histogramTags[0][0])
+	assert.Equal(t, "throttled:true", spy.histogramTags[1][0])
 }
 
 func TestMigratorShouldPrintStatus(t *testing.T) {

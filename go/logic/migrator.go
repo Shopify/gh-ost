@@ -1168,7 +1168,7 @@ func (mgtr *Migrator) initiateInspector() (err error) {
 	return nil
 }
 
-// emitProgressMetrics emits StatsD gauges from a progress snapshot.
+// emitProgressMetrics emits StatsD gauges
 func (mgtr *Migrator) emitProgressMetrics(snap migrationProgressSnapshot) {
 	metrics.EmitProgressGauges(
 		mgtr.migrationContext.Metrics,
@@ -1180,6 +1180,13 @@ func (mgtr *Migrator) emitProgressMetrics(snap migrationProgressSnapshot) {
 		mgtr.migrationContext.Metrics,
 		snap.applyEventsBacklog,
 		snap.applyEventsCapacity,
+	)
+	isThrottled, _, _ := mgtr.migrationContext.IsThrottled()
+	metrics.EmitLagHistograms(
+		mgtr.migrationContext.Metrics,
+		snap.replicationLagSeconds,
+		snap.heartbeatLagSeconds,
+		isThrottled,
 	)
 }
 
