@@ -21,17 +21,13 @@ type Client struct {
 	sd *statsd.Client
 }
 
-// MemStatsGaugeEmitter is implemented by *Client; used for tests without UDP.
 type MemStatsGaugeEmitter interface {
 	Gauge(name string, value float64, tags ...string)
 }
-
-// HistogramEmitter is implemented by *Client; used for tests without UDP.
 type HistogramEmitter interface {
 	Histogram(name string, value float64, tags ...string)
 }
 
-// Emitter combines gauge and histogram emission for migration status metrics.
 type Emitter interface {
 	MemStatsGaugeEmitter
 	HistogramEmitter
