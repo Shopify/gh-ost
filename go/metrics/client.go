@@ -21,9 +21,11 @@ type Client struct {
 	sd *statsd.Client
 }
 
-// MemStatsGaugeEmitter is implemented by *Client; used for tests without UDP.
-type MemStatsGaugeEmitter interface {
+// Emitter is implemented by *Client; used for tests without UDP.
+type Emitter interface {
 	Gauge(name string, value float64, tags ...string)
+	Count(name string, value int64, tags ...string)
+	Histogram(name string, value float64, tags ...string)
 }
 
 // NewClient connects to addr for StatsD. If addr is empty, returns Noop and nil error.
@@ -63,6 +65,13 @@ func (c *Client) Count(name string, value int64, tags ...string) {
 		return
 	}
 	_ = c.sd.Count(name, value, tags, 1.0)
+}
+
+func (c *Client) Histogram(name string, value float64, tags ...string) {
+	if c.sd == nil {
+		return
+	}
+	_ = c.sd.Histogram(name, value, tags, 1.0)
 }
 
 // Close flushes buffered metrics; safe for Noop.
