@@ -129,3 +129,15 @@ func EmitThrottleInterval(emit Emitter, duration time.Duration, reason string) {
 	emit.Histogram("throttle.duration_seconds", duration.Seconds(), tags...)
 	emit.Count("throttle.events_total", 1, tags...)
 }
+
+// RecordQueryDuration emits gh_ost.query.duration_milliseconds with side/kind/outcome tags.
+func RecordQueryDuration(emit Emitter, side string, kind string, duration time.Duration, err error) {
+	if emit == nil || side == "" || kind == "" || duration < 0 {
+		return
+	}
+	outcome := "ok"
+	if err != nil {
+		outcome = "error"
+	}
+	emit.Histogram("query.duration_milliseconds", float64(duration.Milliseconds()), "side:"+side, "kind:"+kind, "outcome:"+outcome)
+}
