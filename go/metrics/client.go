@@ -60,6 +60,13 @@ func (c *Client) Count(name string, value int64, tags ...string) {
 	_ = c.sd.Count(name, value, tags, 1.0)
 }
 
+func (c *Client) Histogram(name string, value float64, tags ...string) {
+	if c.sd == nil {
+		return
+	}
+	_ = c.sd.Histogram(name, value, tags, 1.0)
+}
+
 // Close flushes buffered metrics; safe for Noop.
 func (c *Client) Close() error {
 	if c.sd == nil {
