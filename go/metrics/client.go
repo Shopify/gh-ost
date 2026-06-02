@@ -21,6 +21,11 @@ type Client struct {
 	sd *statsd.Client
 }
 
+// MemStatsGaugeEmitter is implemented by *Client; used for tests without UDP.
+type MemStatsGaugeEmitter interface {
+	Gauge(name string, value float64, tags ...string)
+}
+
 // NewClient connects to addr for StatsD. If addr is empty, returns Noop and nil error.
 // namespace is typically "gh_ost." (metrics are named namespace + short name, e.g. gh_ost.startup).
 // tags are global tags applied to every metric (repeatable --statsd-tags).

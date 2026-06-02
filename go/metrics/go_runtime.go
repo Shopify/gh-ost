@@ -11,11 +11,6 @@ import (
 	"time"
 )
 
-// MemStatsGaugeEmitter is implemented by *Client; used for tests without UDP.
-type MemStatsGaugeEmitter interface {
-	Gauge(name string, value float64, tags ...string)
-}
-
 // EmitGoRuntimeGauges emits gh_ost.go_runtime.* gauges (namespace is applied by the client).
 // m and numGoroutine are typically from runtime.ReadMemStats and runtime.NumGoroutine.
 func EmitGoRuntimeGauges(emit MemStatsGaugeEmitter, m *runtime.MemStats, numGoroutine int) {
