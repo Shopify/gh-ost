@@ -129,3 +129,15 @@ func EmitThrottleInterval(emit Emitter, duration time.Duration, reason string) {
 	emit.Histogram("throttle.duration_seconds", duration.Seconds(), tags...)
 	emit.Count("throttle.events_total", 1, tags...)
 }
+
+// RecordSleep emits per-stage sleep/wait metrics (namespace is applied by the client):
+// gh_ost.sleep.duration_milliseconds and gh_ost.sleep.total_milliseconds, both tagged by stage.
+func RecordSleep(emit Emitter, stage string, d time.Duration) {
+	if emit == nil || stage == "" || d < 0 {
+		return
+	}
+	tags := []string{"stage:" + stage}
+	milliseconds := d.Milliseconds()
+	emit.Histogram("sleep.duration_milliseconds", float64(milliseconds), tags...)
+	emit.Count("sleep.total_milliseconds", milliseconds, tags...)
+}
