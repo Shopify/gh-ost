@@ -7,7 +7,7 @@ package metrics
 
 // EmitProgressGauges emits row-copy and DML progress gauges (namespace is applied by the client):
 // gh_ost.row_copy.rows_copied, gh_ost.row_copy.rows_estimate, gh_ost.dml.events_applied.
-func EmitProgressGauges(emit Emitter, rowsCopied, rowsEstimate, dmlEventsApplied int64) {
+func EmitProgressGauges(emit MemStatsGaugeEmitter, rowsCopied, rowsEstimate, dmlEventsApplied int64) {
 	if emit == nil {
 		return
 	}

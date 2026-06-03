@@ -419,12 +419,6 @@ func (s *progressGaugeSpy) Gauge(name string, value float64, tags ...string) {
 	s.tags = append(s.tags, append([]string(nil), tags...))
 }
 
-func (s *progressGaugeSpy) Count(name string, value int64, tags ...string) {
-}
-
-func (s *progressGaugeSpy) Histogram(name string, value float64, tags ...string) {
-}
-
 func TestReportStatusEmitsProgressGaugesEveryTick(t *testing.T) {
 	spy := &progressGaugeSpy{}
 	ctx := base.NewMigrationContext()

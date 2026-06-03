@@ -7,7 +7,7 @@ package metrics
 
 // EmitBinlogBacklogGauges emits apply-events queue depth gauges (namespace is applied by the client):
 // gh_ost.binlog.backlog_size, gh_ost.binlog.backlog_capacity, gh_ost.binlog.backlog_utilization.
-func EmitBinlogBacklogGauges(emit Emitter, backlogSize, backlogCapacity int) {
+func EmitBinlogBacklogGauges(emit MemStatsGaugeEmitter, backlogSize, backlogCapacity int) {
 	if emit == nil {
 		return
 	}
