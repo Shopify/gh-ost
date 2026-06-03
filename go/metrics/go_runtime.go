@@ -13,7 +13,7 @@ import (
 
 // EmitGoRuntimeGauges emits gh_ost.go_runtime.* gauges (namespace is applied by the client).
 // m and numGoroutine are typically from runtime.ReadMemStats and runtime.NumGoroutine.
-func EmitGoRuntimeGauges(emit MemStatsGaugeEmitter, m *runtime.MemStats, numGoroutine int) {
+func EmitGoRuntimeGauges(emit Emitter, m *runtime.MemStats, numGoroutine int) {
 	if emit == nil || m == nil {
 		return
 	}

@@ -24,6 +24,12 @@ func (g *gaugeSpy) Gauge(name string, value float64, tags ...string) {
 	g.tags = append(g.tags, append([]string(nil), tags...))
 }
 
+func (g *gaugeSpy) Count(name string, value int64, tags ...string) {
+}
+
+func (g *gaugeSpy) Histogram(name string, value float64, tags ...string) {
+}
+
 func TestEmitGoRuntimeGauges(t *testing.T) {
 	spy := &gaugeSpy{}
 	m := &runtime.MemStats{

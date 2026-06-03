@@ -13,7 +13,7 @@ import "fmt"
 // These are point-in-time readings each status tick (not a distribution), so gauges are used
 // rather than histograms — DogStatsD histogram aggregation exposes count/max series that do not
 // match the log line lag values in Prometheus/Grafana.
-func EmitLagGauges(emit MemStatsGaugeEmitter, replicationLagSeconds, heartbeatLagSeconds float64, throttled bool) {
+func EmitLagGauges(emit Emitter, replicationLagSeconds, heartbeatLagSeconds float64, throttled bool) {
 	if emit == nil {
 		return
 	}
