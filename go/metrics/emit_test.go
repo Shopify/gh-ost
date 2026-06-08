@@ -351,8 +351,8 @@ func TestRecordCutOverMetrics(t *testing.T) {
 		t.Fatalf("got counts %#v values %#v", spy.countNames, spy.countValues)
 	}
 	if !slices.Equal(spy.countTags[0], []string{"outcome:success"}) {
-    t.Fatalf("got count tags %#v", spy.countTags[0])
-  }
+		t.Fatalf("got count tags %#v", spy.countTags[0])
+	}
 }
 
 func TestRecordCutOverMetricsNilSafe(t *testing.T) {
@@ -387,7 +387,7 @@ func TestRecordSleep(t *testing.T) {
 }
 
 func TestRecordSleepSubSecond(t *testing.T) {
-	spy := &sleepSpy{}
+	spy := &histogramCountSpy{}
 
 	RecordSleep(spy, "replica_wait", 500*time.Millisecond)
 
@@ -401,6 +401,6 @@ func TestRecordSleepSubSecond(t *testing.T) {
 
 func TestRecordSleepNilSafe(t *testing.T) {
 	RecordSleep(nil, "retry_backoff", time.Second)
-	RecordSleep(&sleepSpy{}, "", time.Second)
-	RecordSleep(&sleepSpy{}, "retry_backoff", -time.Second)
+	RecordSleep(&histogramCountSpy{}, "", time.Second)
+	RecordSleep(&histogramCountSpy{}, "retry_backoff", -time.Second)
 }
