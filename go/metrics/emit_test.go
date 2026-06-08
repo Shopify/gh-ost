@@ -8,6 +8,7 @@ package metrics
 import (
 	"context"
 	"runtime"
+	"slices"
 	"testing"
 	"time"
 )

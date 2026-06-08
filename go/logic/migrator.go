@@ -1875,7 +1875,9 @@ func (mgtr *Migrator) executeWriteFuncs() error {
 							sleepTimeNanosecondFloat64 := niceRatio * float64(copyRowsDuration.Nanoseconds())
 							sleepTime := time.Duration(int64(sleepTimeNanosecondFloat64)) * time.Nanosecond
 							if sleepTime > 0 {
-								metrics.RecordSleep(mgtr.migrationContext.Metrics, "chunk_throttle", sleepTime)
+								if sleepTime >= time.Millisecond {
+									metrics.RecordSleep(mgtr.migrationContext.Metrics, "chunk_throttle", sleepTime)
+								}
 								time.Sleep(sleepTime)
 							}
 						}
