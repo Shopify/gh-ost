@@ -32,6 +32,22 @@ func (g *gaugeSpy) Count(name string, value int64, tags ...string) {
 func (g *gaugeSpy) Histogram(name string, value float64, tags ...string) {
 }
 
+type histogramSpy struct {
+	names  []string
+	values []float64
+	tags   [][]string
+}
+
+func (h *histogramSpy) Gauge(_ string, _ float64, _ ...string) {}
+
+func (h *histogramSpy) Count(_ string, _ int64, _ ...string) {}
+
+func (h *histogramSpy) Histogram(name string, value float64, tags ...string) {
+	h.names = append(h.names, name)
+	h.values = append(h.values, value)
+	h.tags = append(h.tags, tags)
+}
+
 func TestEmitProgressGauges(t *testing.T) {
 	spy := &gaugeSpy{}
 	EmitProgressGauges(spy, 1000, 5000, 42)
@@ -259,22 +275,6 @@ func TestEmitThrottleIntervalNilSafe(t *testing.T) {
 	EmitThrottleInterval(&gaugeSpy{}, time.Second, "test")
 }
 
-type histogramSpy struct {
-	names  []string
-	values []float64
-	tags   [][]string
-}
-
-func (h *histogramSpy) Gauge(_ string, _ float64, _ ...string) {}
-
-func (h *histogramSpy) Count(_ string, _ int64, _ ...string) {}
-
-func (h *histogramSpy) Histogram(name string, value float64, tags ...string) {
-	h.names = append(h.names, name)
-	h.values = append(h.values, value)
-	h.tags = append(h.tags, tags)
-}
-
 func TestRecordQueryDuration(t *testing.T) {
 	spy := &histogramSpy{}
 
@@ -302,7 +302,7 @@ func TestRecordQueryDurationNilSafe(t *testing.T) {
 	RecordQueryDuration(&histogramSpy{}, "source", "row_count", -time.Second, nil)
 }
 
-type sleepSpy struct {
+type histogramCountSpy struct {
 	histogramNames  []string
 	histogramValues []float64
 	histogramTags   [][]string
@@ -311,22 +311,58 @@ type sleepSpy struct {
 	countTags       [][]string
 }
 
-func (s *sleepSpy) Gauge(_ string, _ float64, _ ...string) {}
+func (s *histogramCountSpy) Gauge(_ string, _ float64, _ ...string) {}
 
-func (s *sleepSpy) Histogram(name string, value float64, tags ...string) {
+func (s *histogramCountSpy) Histogram(name string, value float64, tags ...string) {
 	s.histogramNames = append(s.histogramNames, name)
 	s.histogramValues = append(s.histogramValues, value)
 	s.histogramTags = append(s.histogramTags, tags)
 }
 
-func (s *sleepSpy) Count(name string, value int64, tags ...string) {
+func (s *histogramCountSpy) Count(name string, value int64, tags ...string) {
 	s.countNames = append(s.countNames, name)
 	s.countValues = append(s.countValues, value)
 	s.countTags = append(s.countTags, tags)
 }
 
+func TestRecordCutOverMetrics(t *testing.T) {
+	spy := &histogramCountSpy{}
+
+	RecordCutOverPhase(spy, CutOverPhaseMagicLock, 1500*time.Millisecond, nil)
+	RecordCutOverAttempt(spy, CutOverOutcomeSuccess)
+	RecordCutOverTotal(spy, 2*time.Second, errors.New("boom"))
+
+	if len(spy.histogramNames) != 2 {
+		t.Fatalf("got %d histograms, want 2", len(spy.histogramNames))
+	}
+	if spy.histogramNames[0] != "cut_over.phase_duration_milliseconds" || spy.histogramValues[0] != 1500 {
+		t.Fatalf("got first histogram %s=%v", spy.histogramNames[0], spy.histogramValues[0])
+	}
+	if !slices.Equal(spy.histogramTags[0], []string{"phase:magic_lock", "outcome:success"}) {
+		t.Fatalf("got phase tags %#v", spy.histogramTags[0])
+	}
+	if spy.histogramNames[1] != "cut_over.total_duration_milliseconds" || spy.histogramValues[1] != 2000 {
+		t.Fatalf("got second histogram %s=%v", spy.histogramNames[1], spy.histogramValues[1])
+	}
+	if !slices.Equal(spy.histogramTags[1], []string{"outcome:abort"}) {
+		t.Fatalf("got total tags %#v", spy.histogramTags[1])
+	}
+	if len(spy.countNames) != 1 || spy.countNames[0] != "cut_over.attempts_total" || spy.countValues[0] != 1 {
+		t.Fatalf("got counts %#v values %#v", spy.countNames, spy.countValues)
+	}
+	if !slices.Equal(spy.countTags[0], []string{"outcome:success"}) {
+		t.Fatalf("got count tags %#v", spy.countTags[0])
+	}
+}
+
+func TestRecordCutOverMetricsNilSafe(t *testing.T) {
+	RecordCutOverPhase(nil, CutOverPhaseMagicLock, time.Second, nil)
+	RecordCutOverAttempt(nil, CutOverOutcomeSuccess)
+	RecordCutOverTotal(nil, time.Second, nil)
+}
+
 func TestRecordSleep(t *testing.T) {
-	spy := &sleepSpy{}
+	spy := &histogramCountSpy{}
 
 	RecordSleep(spy, "retry_backoff", 2*time.Second)
 
@@ -351,7 +387,7 @@ func TestRecordSleep(t *testing.T) {
 }
 
 func TestRecordSleepSubSecond(t *testing.T) {
-	spy := &sleepSpy{}
+	spy := &histogramCountSpy{}
 
 	RecordSleep(spy, "replica_wait", 500*time.Millisecond)
 
@@ -365,6 +401,6 @@ func TestRecordSleepSubSecond(t *testing.T) {
 
 func TestRecordSleepNilSafe(t *testing.T) {
 	RecordSleep(nil, "retry_backoff", time.Second)
-	RecordSleep(&sleepSpy{}, "", time.Second)
-	RecordSleep(&sleepSpy{}, "retry_backoff", -time.Second)
+	RecordSleep(&histogramCountSpy{}, "", time.Second)
+	RecordSleep(&histogramCountSpy{}, "retry_backoff", -time.Second)
 }
