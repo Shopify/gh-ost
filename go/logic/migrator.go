@@ -1102,8 +1102,6 @@ func (mgtr *Migrator) atomicCutOver() (err error) {
 	}
 	mgtr.migrationContext.Log.Infof("Connection holding lock on original table still exists")
 
-	metrics.RecordCutOverPhase(mgtr.migrationContext.Metrics, metrics.CutOverPhaseMagicRename, time.Since(phaseStartTime), nil)
-
 	// Now that we've found the RENAME blocking, AND the locking connection still alive,
 	// we know it is safe to proceed to release the lock
 
@@ -1118,9 +1116,11 @@ func (mgtr *Migrator) atomicCutOver() (err error) {
 	}
 	metrics.RecordCutOverPhase(mgtr.migrationContext.Metrics, metrics.CutOverPhaseUnlock, time.Since(unlockStartTime), nil)
 	if err := <-tablesRenamed; err != nil {
+		metrics.RecordCutOverPhase(mgtr.migrationContext.Metrics, metrics.CutOverPhaseMagicRename, time.Since(phaseStartTime), err)
 		return mgtr.migrationContext.Log.Errore(err)
 	}
 	mgtr.migrationContext.RenameTablesEndTime = time.Now()
+	metrics.RecordCutOverPhase(mgtr.migrationContext.Metrics, metrics.CutOverPhaseMagicRename, mgtr.migrationContext.RenameTablesEndTime.Sub(phaseStartTime), nil)
 
 	// ooh nice! We're actually truly and thankfully done
 	lockAndRenameDuration := mgtr.migrationContext.RenameTablesEndTime.Sub(mgtr.migrationContext.LockTablesStartTime)
