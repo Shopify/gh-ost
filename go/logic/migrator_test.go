@@ -875,6 +875,7 @@ func (suite *MigratorTestSuite) TestCopierIntPK() {
 
 	migrator := NewMigrator(migrationContext, "0.0.0")
 	suite.Require().NoError(migrator.initiateApplier())
+	defer migrator.applier.Teardown()
 	suite.Require().NoError(migrator.applier.prepareQueries())
 	suite.Require().NoError(migrator.applier.ReadMigrationRangeValues())
 
@@ -946,6 +947,7 @@ func (suite *MigratorTestSuite) TestCopierCompositePK() {
 
 	migrator := NewMigrator(migrationContext, "0.0.0")
 	suite.Require().NoError(migrator.initiateApplier())
+	defer migrator.applier.Teardown()
 	suite.Require().NoError(migrator.applier.prepareQueries())
 	suite.Require().NoError(migrator.applier.ReadMigrationRangeValues())
 
