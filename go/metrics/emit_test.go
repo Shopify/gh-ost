@@ -427,3 +427,92 @@ func TestRecordSleepNilSafe(t *testing.T) {
 	RecordSleep(&sleepSpy{}, "", time.Second)
 	RecordSleep(&sleepSpy{}, "retry_backoff", -time.Second)
 }
+
+func TestRecordBinlogRowsEventMetrics(t *testing.T) {
+	spy := &histogramCountSpy{}
+
+	RecordBinlogRowsEventProcessed(spy, "orders", "insert", 3)
+	RecordBinlogRowsEventFiltered(spy, "other_table", "update", 2)
+	RecordBinlogRowsEventConsumed(spy, "orders", "delete", 1)
+	RecordBinlogRowsInEvent(spy, "orders", 1)
+
+	wantCounts := []struct {
+		name  string
+		value int64
+		tags  []string
+	}{
+		{"binlog_events", 1, []string{"type:processed", "table:orders"}},
+		{"binlog_rows", 3, []string{"type:processed", "table:orders", "binlog_event_type:insert"}},
+		{"binlog_events", 1, []string{"type:filtered", "table:other_table"}},
+		{"binlog_rows", 2, []string{"type:filtered", "table:other_table", "binlog_event_type:update"}},
+		{"binlog_events", 1, []string{"type:consumed", "table:orders", "binlog_event_type:delete"}},
+		{"binlog_rows", 1, []string{"type:consumed", "table:orders", "binlog_event_type:delete"}},
+	}
+	if len(spy.countNames) != len(wantCounts) {
+		t.Fatalf("got %d counts, want %d", len(spy.countNames), len(wantCounts))
+	}
+	for i, want := range wantCounts {
+		if spy.countNames[i] != want.name || spy.countValues[i] != want.value {
+			t.Fatalf("[%d] got %s=%d, want %s=%d", i, spy.countNames[i], spy.countValues[i], want.name, want.value)
+		}
+		if !slices.Equal(spy.countTags[i], want.tags) {
+			t.Fatalf("[%d] got tags %#v, want %#v", i, spy.countTags[i], want.tags)
+		}
+	}
+	if len(spy.histogramNames) != 1 || spy.histogramNames[0] != "binlog_rows_in_event" || spy.histogramValues[0] != 1 {
+		t.Fatalf("got histogram %#v values %#v", spy.histogramNames, spy.histogramValues)
+	}
+	if !slices.Equal(spy.histogramTags[0], []string{"table:orders"}) {
+		t.Fatalf("got histogram tags %#v", spy.histogramTags[0])
+	}
+}
+
+func TestRecordBinlogRowsEventMetricsNilSafe(t *testing.T) {
+	RecordBinlogRowsEventProcessed(nil, "orders", "insert", 1)
+	RecordBinlogRowsEventFiltered(&histogramCountSpy{}, "", "insert", 1)
+	RecordBinlogRowsEventConsumed(&histogramCountSpy{}, "orders", "", 1)
+	RecordBinlogRowsInEvent(&histogramCountSpy{}, "", 1)
+	RecordBinlogRowsInEvent(&histogramCountSpy{}, "orders", -1)
+}
+
+func TestRecordBinlogTransactionMetrics(t *testing.T) {
+	spy := &histogramCountSpy{}
+	gaugeSpy := &gaugeSpy{}
+
+	RecordBinlogTransactionSize(spy, 3, 10)
+	RecordGTIDTransactionLengthBytes(spy, 4096)
+	RecordUnfilteredCommitGroupSize(gaugeSpy, 5)
+	RecordBinlogStreamerBlockedOnOutChannel(spy, 25*time.Millisecond)
+
+	if len(spy.histogramNames) != 4 {
+		t.Fatalf("got %d histograms, want 4: %#v", len(spy.histogramNames), spy.histogramNames)
+	}
+	wantHistograms := []struct {
+		name  string
+		value float64
+	}{
+		{"transaction_num_row_events", 3},
+		{"transaction_num_rows", 10},
+		{"gtid_event_transaction_length_bytes", 4096},
+		{"binlog_streamer_blocked_on_out_channel_ms", 25},
+	}
+	for i, want := range wantHistograms {
+		if spy.histogramNames[i] != want.name || spy.histogramValues[i] != want.value {
+			t.Fatalf("[%d] got %s=%v, want %s=%v", i, spy.histogramNames[i], spy.histogramValues[i], want.name, want.value)
+		}
+	}
+	if len(gaugeSpy.names) != 1 || gaugeSpy.names[0] != "unfiltered_commit_group_size" || gaugeSpy.values[0] != 5 {
+		t.Fatalf("got gauge %#v values %#v", gaugeSpy.names, gaugeSpy.values)
+	}
+}
+
+func TestRecordBinlogTransactionMetricsNilSafe(t *testing.T) {
+	RecordBinlogTransactionSize(nil, 1, 1)
+	RecordBinlogTransactionSize(&histogramCountSpy{}, 0, 1)
+	RecordGTIDTransactionLengthBytes(nil, 100)
+	RecordGTIDTransactionLengthBytes(&histogramCountSpy{}, 0)
+	RecordUnfilteredCommitGroupSize(nil, 1)
+	RecordUnfilteredCommitGroupSize(&gaugeSpy{}, -1)
+	RecordBinlogStreamerBlockedOnOutChannel(nil, time.Second)
+	RecordBinlogStreamerBlockedOnOutChannel(&histogramCountSpy{}, -time.Second)
+}

@@ -172,6 +172,84 @@ func cutOverOutcomeFromError(err error) string {
 	return CutOverOutcomeSuccess
 }
 
+// RecordBinlogRowsEventProcessed emits gh_ost.binlog_events and gh_ost.binlog_rows for a
+// rows event read from the binlog stream.
+func RecordBinlogRowsEventProcessed(emit Emitter, tableName, binlogEventType string, rowCount int64) {
+	if emit == nil || tableName == "" || binlogEventType == "" || rowCount < 0 {
+		return
+	}
+	tableTag := "table:" + tableName
+	eventTypeTag := "binlog_event_type:" + binlogEventType
+	emit.Count("binlog_events", 1, "type:processed", tableTag)
+	emit.Count("binlog_rows", rowCount, "type:processed", tableTag, eventTypeTag)
+}
+
+// RecordBinlogRowsEventFiltered emits gh_ost.binlog_events and gh_ost.binlog_rows for a
+// rows event on a table that is not being migrated.
+func RecordBinlogRowsEventFiltered(emit Emitter, tableName, binlogEventType string, rowCount int64) {
+	if emit == nil || tableName == "" || binlogEventType == "" || rowCount < 0 {
+		return
+	}
+	tableTag := "table:" + tableName
+	eventTypeTag := "binlog_event_type:" + binlogEventType
+	emit.Count("binlog_events", 1, "type:filtered", tableTag)
+	emit.Count("binlog_rows", rowCount, "type:filtered", tableTag, eventTypeTag)
+}
+
+// RecordBinlogRowsEventConsumed emits gh_ost.binlog_events and gh_ost.binlog_rows for a
+// rows event forwarded for application on a migrated table.
+func RecordBinlogRowsEventConsumed(emit Emitter, tableName, binlogEventType string, rowCount int64) {
+	if emit == nil || tableName == "" || binlogEventType == "" || rowCount < 0 {
+		return
+	}
+	tableTag := "table:" + tableName
+	eventTypeTag := "binlog_event_type:" + binlogEventType
+	emit.Count("binlog_events", 1, "type:consumed", tableTag, eventTypeTag)
+	emit.Count("binlog_rows", rowCount, "type:consumed", tableTag, eventTypeTag)
+}
+
+// RecordBinlogRowsInEvent emits gh_ost.binlog_rows_in_event for the row count in a forwarded event.
+func RecordBinlogRowsInEvent(emit Emitter, tableName string, rowCount int64) {
+	if emit == nil || tableName == "" || rowCount < 0 {
+		return
+	}
+	emit.Histogram("binlog_rows_in_event", float64(rowCount), "table:"+tableName)
+}
+
+// RecordBinlogTransactionSize emits row-event and row counts for a completed transaction
+// on relevant (consumed) tables.
+func RecordBinlogTransactionSize(emit Emitter, numRowEvents, numRows int64) {
+	if emit == nil || numRowEvents <= 0 || numRows < 0 {
+		return
+	}
+	emit.Histogram("transaction_num_row_events", float64(numRowEvents))
+	emit.Histogram("transaction_num_rows", float64(numRows))
+}
+
+// RecordGTIDTransactionLengthBytes emits the transaction length from a GTID event (MySQL 8.0.2+).
+func RecordGTIDTransactionLengthBytes(emit Emitter, length uint64) {
+	if emit == nil || length == 0 {
+		return
+	}
+	emit.Histogram("gtid_event_transaction_length_bytes", float64(length))
+}
+
+// RecordUnfilteredCommitGroupSize emits the parallel replication commit group size from a GTID event.
+func RecordUnfilteredCommitGroupSize(emit Emitter, size float64) {
+	if emit == nil || size < 0 {
+		return
+	}
+	emit.Gauge("unfiltered_commit_group_size", size)
+}
+
+// RecordBinlogStreamerBlockedOnOutChannel emits time spent blocked sending rows to the events channel.
+func RecordBinlogStreamerBlockedOnOutChannel(emit Emitter, d time.Duration) {
+	if emit == nil || d < 0 {
+		return
+	}
+	emit.Histogram("binlog_streamer_blocked_on_out_channel_ms", float64(d.Milliseconds()))
+}
+
 // RecordSleep emits per-stage sleep/wait metrics (namespace is applied by the client):
 // gh_ost.sleep.duration_milliseconds and gh_ost.sleep.total_milliseconds, both tagged by stage.
 func RecordSleep(emit Emitter, stage string, d time.Duration) {
