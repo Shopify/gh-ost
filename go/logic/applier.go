@@ -20,6 +20,7 @@ import (
 	"github.com/github/gh-ost/go/binlog"
 	"github.com/github/gh-ost/go/metrics"
 	"github.com/github/gh-ost/go/sql"
+	"github.com/github/gh-ost/go/metrics/tracing"
 
 	"context"
 	"database/sql/driver"
@@ -30,6 +31,7 @@ import (
 	"github.com/github/gh-ost/go/mysql"
 	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/openark/golib/sqlutils"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 const (
@@ -1860,53 +1862,86 @@ func (apl *Applier) executeBatchWithWarningChecking(ctx context.Context, tx *gos
 }
 
 // ApplyDMLEventQueries applies multiple DML queries onto the _ghost_ table
-func (apl *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) error {
-	var totalDelta int64
-	ctx := context.Background()
+func (apl *Applier) ApplyDMLEventQueries(ctx context.Context, dmlEvents [](*binlog.BinlogDMLEvent)) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tp := apl.migrationContext.TracerProvider
+	showWarnings := apl.migrationContext.PanicOnWarnings
+	ctx, endExec := tracing.StartWithError(
+		ctx,
+		tp,
+		tracing.SpanExecuteSQL,
+		attribute.Int("dml.batch_size", len(dmlEvents)),
+		attribute.Bool("dml.show_warnings", showWarnings),
+	)
+	defer func() { endExec(err) }()
 
-	err := func() error {
-		conn, err := apl.db.Conn(ctx)
-		if err != nil {
-			return err
+	var totalDelta int64
+
+	err = func() error {
+		var stepErr error
+
+		ctx, endConn := tracing.StartWithError(ctx, tp, tracing.SpanGetConnection)
+		conn, stepErr := apl.db.Conn(ctx)
+		endConn(stepErr)
+		if stepErr != nil {
+			return stepErr
 		}
 		defer conn.Close()
 
 		sessionQuery := "SET /* gh-ost */ SESSION time_zone = '+00:00'"
 		sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, apl.generateSqlModeQuery())
-		if _, err := conn.ExecContext(ctx, sessionQuery); err != nil {
-			return err
+		ctx, endSession := tracing.StartWithError(ctx, tp, tracing.SpanSetSession)
+		_, stepErr = conn.ExecContext(ctx, sessionQuery)
+		endSession(stepErr)
+		if stepErr != nil {
+			return stepErr
 		}
 
-		tx, err := conn.BeginTx(ctx, nil)
-		if err != nil {
-			return err
+		ctx, endBegin := tracing.StartWithError(ctx, tp, tracing.SpanBeginTx)
+		tx, stepErr := conn.BeginTx(ctx, nil)
+		endBegin(stepErr)
+		if stepErr != nil {
+			return stepErr
 		}
 		rollback := func(err error) error {
 			tx.Rollback()
 			return err
 		}
 
+		ctx, endBuild := tracing.StartWithError(ctx, tp, tracing.SpanBuildQueries)
 		buildResults := make([]*dmlBuildResult, 0, len(dmlEvents))
 		nArgs := 0
 		for _, dmlEvent := range dmlEvents {
 			for _, buildResult := range apl.buildDMLEventQuery(dmlEvent) {
 				if buildResult.err != nil {
+					endBuild(buildResult.err)
 					return rollback(buildResult.err)
 				}
 				nArgs += len(buildResult.args)
 				buildResults = append(buildResults, buildResult)
 			}
 		}
+		endBuild(nil)
 
+		ctx, endBatch := tracing.StartWithError(
+			ctx,
+			tp,
+			tracing.SpanExecuteBatch,
+			attribute.Bool("dml.show_warnings", showWarnings),
+			attribute.Int("dml.statement_count", len(buildResults)),
+		)
 		// When PanicOnWarnings is enabled, we need to check warnings after each statement
 		// in the batch. SHOW WARNINGS only shows warnings from the last statement in a
 		// multi-statement query, so we interleave SHOW WARNINGS after each DML statement.
-		if apl.migrationContext.PanicOnWarnings {
+		if showWarnings {
 			queryStartTime := time.Now()
-			totalDelta, err = apl.executeBatchWithWarningChecking(ctx, tx, buildResults)
-			metrics.RecordQueryDuration(apl.migrationContext.Metrics, "target", "binlog_apply", time.Since(queryStartTime), err)
-			if err != nil {
-				return rollback(err)
+			totalDelta, stepErr = apl.executeBatchWithWarningChecking(ctx, tx, buildResults)
+			metrics.RecordQueryDuration(apl.migrationContext.Metrics, "target", "binlog_apply", time.Since(queryStartTime), stepErr)
+			endBatch(stepErr)
+			if stepErr != nil {
+				return rollback(stepErr)
 			}
 		} else {
 			// Fast path: batch together DML queries into multi-statements to minimize network trips.
@@ -1946,13 +1981,17 @@ func (apl *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) e
 			})
 
 			metrics.RecordQueryDuration(apl.migrationContext.Metrics, "target", "binlog_apply", time.Since(queryStartTime), execErr)
+			endBatch(execErr)
 			if execErr != nil {
 				return rollback(execErr)
 			}
 		}
 
-		if err := tx.Commit(); err != nil {
-			return err
+		_, endCommit := tracing.StartWithError(ctx, tp, tracing.SpanCommitTx)
+		commitErr := tx.Commit()
+		endCommit(commitErr)
+		if commitErr != nil {
+			return commitErr
 		}
 		return nil
 	}()

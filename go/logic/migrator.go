@@ -21,6 +21,9 @@ import (
 	"github.com/github/gh-ost/go/metrics"
 	"github.com/github/gh-ost/go/mysql"
 	"github.com/github/gh-ost/go/sql"
+	"github.com/github/gh-ost/go/metrics/tracing"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 var (
@@ -1576,9 +1579,10 @@ func (mgtr *Migrator) addDMLEventsListener() error {
 		mgtr.migrationContext.DatabaseName,
 		mgtr.migrationContext.OriginalTableName,
 		func(dmlEntry *binlog.BinlogEntry) error {
+			eventStruct := newApplyEventStructByDML(dmlEntry)
 			// Use helper to prevent deadlock if buffer fills and executeWriteFuncs exits
 			// This is critical because this callback blocks the event streamer
-			return base.SendWithContext(mgtr.migrationContext.GetContext(), mgtr.applyEventsQueue, newApplyEventStructByDML(dmlEntry))
+			return base.SendWithContext(mgtr.migrationContext.GetContext(), mgtr.applyEventsQueue, eventStruct)
 		},
 	)
 	return err
@@ -1788,8 +1792,7 @@ func (mgtr *Migrator) onApplyEventStruct(eventStruct *applyEventStruct) error {
 		return handleNonDMLEventStruct(eventStruct)
 	}
 	if eventStruct.dmlEvent != nil {
-		dmlEvents := [](*binlog.BinlogDMLEvent){}
-		dmlEvents = append(dmlEvents, eventStruct.dmlEvent)
+		dmlEvents := [](*binlog.BinlogDMLEvent){eventStruct.dmlEvent}
 		var nonDmlStructToApply *applyEventStruct
 		var completedTransaction *applyEventStruct
 
@@ -1811,12 +1814,29 @@ func (mgtr *Migrator) onApplyEventStruct(eventStruct *applyEventStruct) error {
 			}
 			dmlEvents = append(dmlEvents, additionalStruct.dmlEvent)
 		}
+
+		applyCtx, endApply := tracing.StartWithError(
+			mgtr.migrationContext.GetContext(),
+			mgtr.migrationContext.TracerProvider,
+			tracing.SpanApplyBatch,
+			append(
+				tracing.DMLEventAttributes(
+					mgtr.migrationContext.DatabaseName,
+					mgtr.migrationContext.OriginalTableName,
+					eventStruct.dmlEvent.DML.EventTypeTag(),
+				),
+				attribute.Int("dml.batch_size", len(dmlEvents)),
+			)...,
+		)
+
 		// Create a task to apply the DML event; this will be execute by executeWriteFuncs()
 		var applyEventFunc tableWriteFunc = func() error {
-			return mgtr.applier.ApplyDMLEventQueries(dmlEvents)
+			return mgtr.applier.ApplyDMLEventQueries(applyCtx, dmlEvents)
 		}
-		if err := mgtr.retryOperation(applyEventFunc); err != nil {
-			return mgtr.migrationContext.Log.Errore(err)
+		applyErr := mgtr.retryOperation(applyEventFunc)
+		endApply(applyErr)
+		if applyErr != nil {
+			return mgtr.migrationContext.Log.Errore(applyErr)
 		}
 		// update applier coordinates
 		mgtr.applier.CurrentCoordinatesMutex.Lock()

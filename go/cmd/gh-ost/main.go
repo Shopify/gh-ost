@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net/url"
@@ -18,6 +19,7 @@ import (
 	"github.com/github/gh-ost/go/base"
 	"github.com/github/gh-ost/go/logic"
 	"github.com/github/gh-ost/go/metrics"
+	"github.com/github/gh-ost/go/metrics/tracing"
 	"github.com/github/gh-ost/go/sql"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/openark/golib/log"
@@ -177,6 +179,7 @@ func main() {
 	var statsdTags statsdTagList
 	flag.Var(&statsdTags, "statsd-tags", "global StatsD tags applied to every metric (repeatable), format key:value. Example: --statsd-tags 'env:prod,service:my-service'")
 	runtimeMetricsInterval := flag.Int("runtime-metrics-interval", 10, "Seconds between Go runtime memory/GC gauge samples (requires --statsd-addr); 0 disables")
+	otelEndpoint := flag.String("otel-endpoint", "", "OTLP/HTTP trace exporter endpoint URL; empty disables tracing. Example: http://localhost:4318/v1/traces")
 	quiet := flag.Bool("quiet", false, "quiet")
 	verbose := flag.Bool("verbose", false, "verbose")
 	debug := flag.Bool("debug", false, "debug mode (very verbose)")
@@ -405,6 +408,22 @@ func main() {
 	metricsClient.Count("startup", 1)
 	if *runtimeMetricsInterval > 0 {
 		metrics.StartGoRuntimeReporter(migrationContext.GetContext(), metricsClient, time.Duration(*runtimeMetricsInterval)*time.Second)
+	}
+
+	traceProvider, traceErr := tracing.NewProvider(migrationContext.GetContext(), *otelEndpoint)
+	if traceErr != nil {
+		log.Fatalf("tracing: %v", traceErr)
+	}
+	if traceProvider != nil {
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), tracing.ShutdownTimeout)
+			defer cancel()
+			_ = traceProvider.Shutdown(shutdownCtx)
+		}()
+		migrationContext.TracerProvider = traceProvider.TracerProvider()
+		log.Infof("tracing: OpenTelemetry export enabled (endpoint: %s)", *otelEndpoint)
+	} else {
+		migrationContext.TracerProvider = tracing.NoopProvider
 	}
 
 	migrator := logic.NewMigrator(migrationContext, AppVersion)
