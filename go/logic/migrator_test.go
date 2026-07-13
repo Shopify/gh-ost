@@ -420,11 +420,8 @@ func (s *progressGaugeSpy) Gauge(name string, value float64, tags ...string) {
 	s.tags = append(s.tags, append([]string(nil), tags...))
 }
 
-func (s *progressGaugeSpy) Count(name string, value int64, tags ...string) {
-}
-
-func (s *progressGaugeSpy) Histogram(name string, value float64, tags ...string) {
-}
+func (s *progressGaugeSpy) Count(_ string, _ int64, _ ...string)       {}
+func (s *progressGaugeSpy) Histogram(_ string, _ float64, _ ...string) {}
 
 type cutOverMetricsSpy struct {
 	countNames     []string

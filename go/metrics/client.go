@@ -21,7 +21,8 @@ type Client struct {
 	sd *statsd.Client
 }
 
-// Emitter is implemented by *Client; used for tests without UDP.
+// Emitter is the unified metrics abstraction implemented by *Client. Helpers in
+// the metrics package take an Emitter so tests can supply spies without UDP.
 type Emitter interface {
 	Gauge(name string, value float64, tags ...string)
 	Count(name string, value int64, tags ...string)

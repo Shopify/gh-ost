@@ -126,7 +126,7 @@ func EmitThrottleInterval(emit Emitter, duration time.Duration, reason string) {
 		return
 	}
 	tags := []string{fmt.Sprintf("reason:%s", reason)}
-	emit.Histogram("throttle.duration_seconds", duration.Seconds(), tags...)
+	emit.Histogram("throttle.duration_milliseconds", float64(duration.Milliseconds()), tags...)
 	emit.Count("throttle.events_total", 1, tags...)
 }
 
@@ -172,18 +172,6 @@ func cutOverOutcomeFromError(err error) string {
 	return CutOverOutcomeSuccess
 }
 
-// RecordQueryDuration emits gh_ost.query.duration_milliseconds with side/kind/outcome tags.
-func RecordQueryDuration(emit Emitter, side string, kind string, duration time.Duration, err error) {
-	if emit == nil || side == "" || kind == "" || duration < 0 {
-		return
-	}
-	outcome := "ok"
-	if err != nil {
-		outcome = "error"
-	}
-	emit.Histogram("query.duration_milliseconds", float64(duration.Milliseconds()), "side:"+side, "kind:"+kind, "outcome:"+outcome)
-}
-
 // RecordSleep emits per-stage sleep/wait metrics (namespace is applied by the client):
 // gh_ost.sleep.duration_milliseconds and gh_ost.sleep.total_milliseconds, both tagged by stage.
 func RecordSleep(emit Emitter, stage string, d time.Duration) {
@@ -194,4 +182,16 @@ func RecordSleep(emit Emitter, stage string, d time.Duration) {
 	milliseconds := d.Milliseconds()
 	emit.Histogram("sleep.duration_milliseconds", float64(milliseconds), tags...)
 	emit.Count("sleep.total_milliseconds", milliseconds, tags...)
+}
+
+// RecordQueryDuration emits gh_ost.query.duration_milliseconds with side/kind/outcome tags.
+func RecordQueryDuration(emit Emitter, side string, kind string, duration time.Duration, err error) {
+	if emit == nil || side == "" || kind == "" || duration < 0 {
+		return
+	}
+	outcome := "ok"
+	if err != nil {
+		outcome = "error"
+	}
+	emit.Histogram("query.duration_milliseconds", float64(duration.Milliseconds()), "side:"+side, "kind:"+kind, "outcome:"+outcome)
 }

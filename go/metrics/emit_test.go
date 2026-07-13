@@ -32,22 +32,6 @@ func (g *gaugeSpy) Count(name string, value int64, tags ...string) {
 func (g *gaugeSpy) Histogram(name string, value float64, tags ...string) {
 }
 
-type histogramSpy struct {
-	names  []string
-	values []float64
-	tags   [][]string
-}
-
-func (h *histogramSpy) Gauge(_ string, _ float64, _ ...string) {}
-
-func (h *histogramSpy) Count(_ string, _ int64, _ ...string) {}
-
-func (h *histogramSpy) Histogram(name string, value float64, tags ...string) {
-	h.names = append(h.names, name)
-	h.values = append(h.values, value)
-	h.tags = append(h.tags, tags)
-}
-
 func TestEmitProgressGauges(t *testing.T) {
 	spy := &gaugeSpy{}
 	EmitProgressGauges(spy, 1000, 5000, 42)
@@ -254,8 +238,8 @@ func TestEmitThrottleInterval(t *testing.T) {
 	if len(spy.histogramNames) != 1 {
 		t.Fatalf("got %d histograms, want 1", len(spy.histogramNames))
 	}
-	if spy.histogramNames[0] != "throttle.duration_seconds" || spy.histogramValues[0] != 1.5 {
-		t.Fatalf("got %s=%v, want throttle.duration_seconds=1.5", spy.histogramNames[0], spy.histogramValues[0])
+	if spy.histogramNames[0] != "throttle.duration_milliseconds" || spy.histogramValues[0] != 1500 {
+		t.Fatalf("got %s=%v, want throttle.duration_milliseconds=1500", spy.histogramNames[0], spy.histogramValues[0])
 	}
 	if len(spy.countNames) != 1 {
 		t.Fatalf("got %d counts, want 1", len(spy.countNames))
@@ -275,34 +259,7 @@ func TestEmitThrottleIntervalNilSafe(t *testing.T) {
 	EmitThrottleInterval(&gaugeSpy{}, time.Second, "test")
 }
 
-func TestRecordQueryDuration(t *testing.T) {
-	spy := &histogramSpy{}
-
-	RecordQueryDuration(spy, "source", "row_count", 1500*time.Millisecond, nil)
-	RecordQueryDuration(spy, "target", "binlog_apply", 2*time.Second, errors.New("boom"))
-
-	if len(spy.names) != 2 {
-		t.Fatalf("got %d histograms, want 2", len(spy.names))
-	}
-	if spy.names[0] != "query.duration_milliseconds" || spy.values[0] != 1500 {
-		t.Fatalf("got %s=%v, want query.duration_milliseconds=1500", spy.names[0], spy.values[0])
-	}
-	if !slices.Equal(spy.tags[0], []string{"side:source", "kind:row_count", "outcome:ok"}) {
-		t.Fatalf("got tags %#v", spy.tags[0])
-	}
-	if spy.values[1] != 2000 || !slices.Equal(spy.tags[1], []string{"side:target", "kind:binlog_apply", "outcome:error"}) {
-		t.Fatalf("got second metric value=%v tags=%#v", spy.values[1], spy.tags[1])
-	}
-}
-
-func TestRecordQueryDurationNilSafe(t *testing.T) {
-	RecordQueryDuration(nil, "source", "row_count", time.Second, nil)
-	RecordQueryDuration(&histogramSpy{}, "", "row_count", time.Second, nil)
-	RecordQueryDuration(&histogramSpy{}, "source", "", time.Second, nil)
-	RecordQueryDuration(&histogramSpy{}, "source", "row_count", -time.Second, nil)
-}
-
-type histogramCountSpy struct {
+type cutOverSpy struct {
 	histogramNames  []string
 	histogramValues []float64
 	histogramTags   [][]string
@@ -311,22 +268,22 @@ type histogramCountSpy struct {
 	countTags       [][]string
 }
 
-func (s *histogramCountSpy) Gauge(_ string, _ float64, _ ...string) {}
+func (s *cutOverSpy) Gauge(_ string, _ float64, _ ...string) {}
 
-func (s *histogramCountSpy) Histogram(name string, value float64, tags ...string) {
+func (s *cutOverSpy) Histogram(name string, value float64, tags ...string) {
 	s.histogramNames = append(s.histogramNames, name)
 	s.histogramValues = append(s.histogramValues, value)
 	s.histogramTags = append(s.histogramTags, tags)
 }
 
-func (s *histogramCountSpy) Count(name string, value int64, tags ...string) {
+func (s *cutOverSpy) Count(name string, value int64, tags ...string) {
 	s.countNames = append(s.countNames, name)
 	s.countValues = append(s.countValues, value)
 	s.countTags = append(s.countTags, tags)
 }
 
 func TestRecordCutOverMetrics(t *testing.T) {
-	spy := &histogramCountSpy{}
+	spy := &cutOverSpy{}
 
 	RecordCutOverPhase(spy, CutOverPhaseMagicLock, 1500*time.Millisecond, nil)
 	RecordCutOverAttempt(spy, CutOverOutcomeSuccess)
@@ -361,8 +318,74 @@ func TestRecordCutOverMetricsNilSafe(t *testing.T) {
 	RecordCutOverTotal(nil, time.Second, nil)
 }
 
+type histogramSpy struct {
+	names  []string
+	values []float64
+	tags   [][]string
+}
+
+func (h *histogramSpy) Gauge(_ string, _ float64, _ ...string) {}
+
+func (h *histogramSpy) Count(_ string, _ int64, _ ...string) {}
+
+func (h *histogramSpy) Histogram(name string, value float64, tags ...string) {
+	h.names = append(h.names, name)
+	h.values = append(h.values, value)
+	h.tags = append(h.tags, tags)
+}
+
+func TestRecordQueryDuration(t *testing.T) {
+	spy := &histogramSpy{}
+
+	RecordQueryDuration(spy, "source", "row_count", 1500*time.Millisecond, nil)
+	RecordQueryDuration(spy, "target", "binlog_apply", 2*time.Second, errors.New("boom"))
+
+	if len(spy.names) != 2 {
+		t.Fatalf("got %d histograms, want 2", len(spy.names))
+	}
+	if spy.names[0] != "query.duration_milliseconds" || spy.values[0] != 1500 {
+		t.Fatalf("got %s=%v, want query.duration_milliseconds=1500", spy.names[0], spy.values[0])
+	}
+	if !slices.Equal(spy.tags[0], []string{"side:source", "kind:row_count", "outcome:ok"}) {
+		t.Fatalf("got tags %#v", spy.tags[0])
+	}
+	if spy.values[1] != 2000 || !slices.Equal(spy.tags[1], []string{"side:target", "kind:binlog_apply", "outcome:error"}) {
+		t.Fatalf("got second metric value=%v tags=%#v", spy.values[1], spy.tags[1])
+	}
+}
+
+func TestRecordQueryDurationNilSafe(t *testing.T) {
+	RecordQueryDuration(nil, "source", "row_count", time.Second, nil)
+	RecordQueryDuration(&histogramSpy{}, "", "row_count", time.Second, nil)
+	RecordQueryDuration(&histogramSpy{}, "source", "", time.Second, nil)
+	RecordQueryDuration(&histogramSpy{}, "source", "row_count", -time.Second, nil)
+}
+
+type sleepSpy struct {
+	histogramNames  []string
+	histogramValues []float64
+	histogramTags   [][]string
+	countNames      []string
+	countValues     []int64
+	countTags       [][]string
+}
+
+func (s *sleepSpy) Gauge(_ string, _ float64, _ ...string) {}
+
+func (s *sleepSpy) Histogram(name string, value float64, tags ...string) {
+	s.histogramNames = append(s.histogramNames, name)
+	s.histogramValues = append(s.histogramValues, value)
+	s.histogramTags = append(s.histogramTags, tags)
+}
+
+func (s *sleepSpy) Count(name string, value int64, tags ...string) {
+	s.countNames = append(s.countNames, name)
+	s.countValues = append(s.countValues, value)
+	s.countTags = append(s.countTags, tags)
+}
+
 func TestRecordSleep(t *testing.T) {
-	spy := &histogramCountSpy{}
+	spy := &sleepSpy{}
 
 	RecordSleep(spy, "retry_backoff", 2*time.Second)
 
@@ -387,7 +410,7 @@ func TestRecordSleep(t *testing.T) {
 }
 
 func TestRecordSleepSubSecond(t *testing.T) {
-	spy := &histogramCountSpy{}
+	spy := &sleepSpy{}
 
 	RecordSleep(spy, "replica_wait", 500*time.Millisecond)
 
@@ -401,6 +424,6 @@ func TestRecordSleepSubSecond(t *testing.T) {
 
 func TestRecordSleepNilSafe(t *testing.T) {
 	RecordSleep(nil, "retry_backoff", time.Second)
-	RecordSleep(&histogramCountSpy{}, "", time.Second)
-	RecordSleep(&histogramCountSpy{}, "retry_backoff", -time.Second)
+	RecordSleep(&sleepSpy{}, "", time.Second)
+	RecordSleep(&sleepSpy{}, "retry_backoff", -time.Second)
 }

@@ -93,8 +93,8 @@ type Migrator struct {
 	rowCopyComplete            chan error
 	allEventsUpToLockProcessed chan *lockProcessedStruct
 	lastLockProcessed          *lockProcessedStruct
-	rowCopyCompleteFlag        int64
 
+	rowCopyCompleteFlag int64
 	// copyRowsQueue should not be buffered; if buffered some non-damaging but
 	//  excessive work happens at the end of the iteration as new copy-jobs arrive before realizing the copy is complete
 	copyRowsQueue    chan tableWriteFunc
@@ -1217,7 +1217,7 @@ func (mgtr *Migrator) initiateInspector() (err error) {
 	return nil
 }
 
-// emitProgressMetrics emits StatsD gauges
+// emitProgressMetrics emits StatsD gauges from a progress snapshot.
 func (mgtr *Migrator) emitProgressMetrics(snap migrationProgressSnapshot) {
 	metrics.EmitProgressGauges(
 		mgtr.migrationContext.Metrics,
