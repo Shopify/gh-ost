@@ -319,19 +319,26 @@ func TestRecordCutOverMetricsNilSafe(t *testing.T) {
 }
 
 type histogramSpy struct {
-	names  []string
-	values []float64
-	tags   [][]string
+	names       []string
+	values      []float64
+	tags        [][]string
+	countNames  []string
+	countValues []int64
+	countTags   [][]string
 }
 
 func (h *histogramSpy) Gauge(_ string, _ float64, _ ...string) {}
 
-func (h *histogramSpy) Count(_ string, _ int64, _ ...string) {}
+func (h *histogramSpy) Count(name string, value int64, tags ...string) {
+	h.countNames = append(h.countNames, name)
+	h.countValues = append(h.countValues, value)
+	h.countTags = append(h.countTags, append([]string(nil), tags...))
+}
 
 func (h *histogramSpy) Histogram(name string, value float64, tags ...string) {
 	h.names = append(h.names, name)
 	h.values = append(h.values, value)
-	h.tags = append(h.tags, tags)
+	h.tags = append(h.tags, append([]string(nil), tags...))
 }
 
 func TestRecordQueryDuration(t *testing.T) {
@@ -428,31 +435,8 @@ func TestRecordSleepNilSafe(t *testing.T) {
 	RecordSleep(&sleepSpy{}, "retry_backoff", -time.Second)
 }
 
-type histogramCountSpy struct {
-	histogramNames  []string
-	histogramValues []float64
-	histogramTags   [][]string
-	countNames      []string
-	countValues     []int64
-	countTags       [][]string
-}
-
-func (s *histogramCountSpy) Gauge(_ string, _ float64, _ ...string) {}
-
-func (s *histogramCountSpy) Histogram(name string, value float64, tags ...string) {
-	s.histogramNames = append(s.histogramNames, name)
-	s.histogramValues = append(s.histogramValues, value)
-	s.histogramTags = append(s.histogramTags, append([]string(nil), tags...))
-}
-
-func (s *histogramCountSpy) Count(name string, value int64, tags ...string) {
-	s.countNames = append(s.countNames, name)
-	s.countValues = append(s.countValues, value)
-	s.countTags = append(s.countTags, append([]string(nil), tags...))
-}
-
 func TestRecordBinlogRowsEventMetrics(t *testing.T) {
-	spy := &histogramCountSpy{}
+	spy := &histogramSpy{}
 
 	RecordBinlogRowsEventProcessed(spy, "orders", "insert", 3)
 	RecordBinlogRowsEventFiltered(spy, "other_table", "update", 2)
@@ -482,24 +466,24 @@ func TestRecordBinlogRowsEventMetrics(t *testing.T) {
 			t.Fatalf("[%d] got tags %#v, want %#v", i, spy.countTags[i], want.tags)
 		}
 	}
-	if len(spy.histogramNames) != 1 || spy.histogramNames[0] != "binlog_rows_in_event" || spy.histogramValues[0] != 1 {
-		t.Fatalf("got histogram %#v values %#v", spy.histogramNames, spy.histogramValues)
+	if len(spy.names) != 1 || spy.names[0] != "binlog_rows_in_event" || spy.values[0] != 1 {
+		t.Fatalf("got histogram %#v values %#v", spy.names, spy.values)
 	}
-	if !slices.Equal(spy.histogramTags[0], []string{"table:orders"}) {
-		t.Fatalf("got histogram tags %#v", spy.histogramTags[0])
+	if !slices.Equal(spy.tags[0], []string{"table:orders"}) {
+		t.Fatalf("got histogram tags %#v", spy.tags[0])
 	}
 }
 
 func TestRecordBinlogRowsEventMetricsNilSafe(t *testing.T) {
 	RecordBinlogRowsEventProcessed(nil, "orders", "insert", 1)
-	RecordBinlogRowsEventFiltered(&histogramCountSpy{}, "", "insert", 1)
-	RecordBinlogRowsEventConsumed(&histogramCountSpy{}, "orders", "", 1)
-	RecordBinlogRowsInEvent(&histogramCountSpy{}, "", 1)
-	RecordBinlogRowsInEvent(&histogramCountSpy{}, "orders", -1)
+	RecordBinlogRowsEventFiltered(&histogramSpy{}, "", "insert", 1)
+	RecordBinlogRowsEventConsumed(&histogramSpy{}, "orders", "", 1)
+	RecordBinlogRowsInEvent(&histogramSpy{}, "", 1)
+	RecordBinlogRowsInEvent(&histogramSpy{}, "orders", -1)
 }
 
 func TestRecordBinlogTransactionMetrics(t *testing.T) {
-	spy := &histogramCountSpy{}
+	spy := &histogramSpy{}
 	gaugeSpy := &gaugeSpy{}
 
 	RecordBinlogTransactionSize(spy, 3, 10)
@@ -507,8 +491,8 @@ func TestRecordBinlogTransactionMetrics(t *testing.T) {
 	RecordUnfilteredCommitGroupSize(gaugeSpy, 5)
 	RecordBinlogStreamerBlockedOnOutChannel(spy, 25*time.Millisecond)
 
-	if len(spy.histogramNames) != 4 {
-		t.Fatalf("got %d histograms, want 4: %#v", len(spy.histogramNames), spy.histogramNames)
+	if len(spy.names) != 4 {
+		t.Fatalf("got %d histograms, want 4: %#v", len(spy.names), spy.names)
 	}
 	wantHistograms := []struct {
 		name  string
@@ -520,8 +504,8 @@ func TestRecordBinlogTransactionMetrics(t *testing.T) {
 		{"binlog_streamer_blocked_on_out_channel_ms", 25},
 	}
 	for i, want := range wantHistograms {
-		if spy.histogramNames[i] != want.name || spy.histogramValues[i] != want.value {
-			t.Fatalf("[%d] got %s=%v, want %s=%v", i, spy.histogramNames[i], spy.histogramValues[i], want.name, want.value)
+		if spy.names[i] != want.name || spy.values[i] != want.value {
+			t.Fatalf("[%d] got %s=%v, want %s=%v", i, spy.names[i], spy.values[i], want.name, want.value)
 		}
 	}
 	if len(gaugeSpy.names) != 1 || gaugeSpy.names[0] != "unfiltered_commit_group_size" || gaugeSpy.values[0] != 5 {
@@ -531,11 +515,11 @@ func TestRecordBinlogTransactionMetrics(t *testing.T) {
 
 func TestRecordBinlogTransactionMetricsNilSafe(t *testing.T) {
 	RecordBinlogTransactionSize(nil, 1, 1)
-	RecordBinlogTransactionSize(&histogramCountSpy{}, 0, 1)
+	RecordBinlogTransactionSize(&histogramSpy{}, 0, 1)
 	RecordGTIDTransactionLengthBytes(nil, 100)
-	RecordGTIDTransactionLengthBytes(&histogramCountSpy{}, 0)
+	RecordGTIDTransactionLengthBytes(&histogramSpy{}, 0)
 	RecordUnfilteredCommitGroupSize(nil, 1)
 	RecordUnfilteredCommitGroupSize(&gaugeSpy{}, -1)
 	RecordBinlogStreamerBlockedOnOutChannel(nil, time.Second)
-	RecordBinlogStreamerBlockedOnOutChannel(&histogramCountSpy{}, -time.Second)
+	RecordBinlogStreamerBlockedOnOutChannel(&histogramSpy{}, -time.Second)
 }
