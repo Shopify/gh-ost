@@ -428,6 +428,29 @@ func TestRecordSleepNilSafe(t *testing.T) {
 	RecordSleep(&sleepSpy{}, "retry_backoff", -time.Second)
 }
 
+type histogramCountSpy struct {
+	histogramNames  []string
+	histogramValues []float64
+	histogramTags   [][]string
+	countNames      []string
+	countValues     []int64
+	countTags       [][]string
+}
+
+func (s *histogramCountSpy) Gauge(_ string, _ float64, _ ...string) {}
+
+func (s *histogramCountSpy) Histogram(name string, value float64, tags ...string) {
+	s.histogramNames = append(s.histogramNames, name)
+	s.histogramValues = append(s.histogramValues, value)
+	s.histogramTags = append(s.histogramTags, append([]string(nil), tags...))
+}
+
+func (s *histogramCountSpy) Count(name string, value int64, tags ...string) {
+	s.countNames = append(s.countNames, name)
+	s.countValues = append(s.countValues, value)
+	s.countTags = append(s.countTags, append([]string(nil), tags...))
+}
+
 func TestRecordBinlogRowsEventMetrics(t *testing.T) {
 	spy := &histogramCountSpy{}
 
