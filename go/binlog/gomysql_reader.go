@@ -49,7 +49,8 @@ type GoMySQLReader struct {
 	currentCoordinates      mysql.BinlogCoordinates
 	currentCoordinatesMutex *sync.Mutex
 	// LastTrxCoords are the coordinates of the last transaction completely read.
-	// If using the file coordinates it is binlog position of the transaction's XID event.
+	// For file coordinates, this is the end position of the transaction's XID
+	// event or its enclosing compressed payload.
 	LastTrxCoords mysql.BinlogCoordinates
 
 	// Per-transaction counters for relevant (consumed) row events, flushed at transaction boundaries.
@@ -220,6 +221,21 @@ func (gmr *GoMySQLReader) handleRowsEvent(ev *replication.BinlogEvent, rowsEvent
 	return nil
 }
 
+func (gmr *GoMySQLReader) completeTransaction(event *replication.XIDEvent) {
+	if !gmr.migrationContext.UseGTIDs {
+		gmr.flushTransactionMetrics()
+	}
+	if gmr.migrationContext.UseGTIDs && event.GSet != nil {
+		coords := &mysql.GTIDBinlogCoordinates{GTIDSet: event.GSet}
+		gmr.LastTrxCoords = coords.Clone()
+	} else {
+		// File positions use the current outer event's coordinates. For GTID
+		// events parsed without the syncer, fall back to the coordinates
+		// already updated by the preceding GTID event.
+		gmr.LastTrxCoords = gmr.GetCurrentBinlogCoordinates()
+	}
+}
+
 // StreamEvents
 func (gmr *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesChannel chan<- *BinlogEntry) error {
 	for !canStopStreaming() {
@@ -283,21 +299,24 @@ func (gmr *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesChan
 			gmr.migrationContext.Log.Infof("rotate to next log from %s:%d to %s", coords.LogFile, int64(ev.Header.LogPos), event.NextLogName)
 			gmr.currentCoordinatesMutex.Unlock()
 		case *replication.XIDEvent:
-			if !gmr.migrationContext.UseGTIDs {
-				gmr.flushTransactionMetrics()
-			}
-			if gmr.migrationContext.UseGTIDs {
-				// event.GSet is the full executed GTID set maintained by the
-				// syncer (MysqlGTIDSet or MariadbGTIDSet depending on flavor).
-				if event.GSet != nil {
-					gmr.LastTrxCoords = &mysql.GTIDBinlogCoordinates{GTIDSet: event.GSet}
-				}
-			} else {
-				gmr.LastTrxCoords = gmr.currentCoordinates.Clone()
-			}
+			gmr.completeTransaction(event)
 		case *replication.RowsEvent:
 			if err := gmr.handleRowsEvent(ev, event, entriesChannel); err != nil {
 				return err
+			}
+		case *replication.TransactionPayloadEvent:
+			// Keep the outer payload's coordinates for every row and the commit,
+			// rather than the synthetic boundary positions on nested events.
+			// Process the whole transaction before checking canStopStreaming.
+			for _, nested := range event.Events {
+				switch nestedEvent := nested.Event.(type) {
+				case *replication.RowsEvent:
+					if err := gmr.handleRowsEvent(nested, nestedEvent, entriesChannel); err != nil {
+						return err
+					}
+				case *replication.XIDEvent:
+					gmr.completeTransaction(nestedEvent)
+				}
 			}
 		}
 	}
