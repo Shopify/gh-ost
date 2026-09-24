@@ -21,7 +21,6 @@ import (
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
-	uuid "github.com/google/uuid"
 )
 
 type RowsEventFilterFunc func(databaseName, tableName string) bool
@@ -67,7 +66,7 @@ func NewGoMySQLReader(migrationContext *base.MigrationContext, rowsEventFilters 
 	}
 	config := replication.BinlogSyncerConfig{
 		ServerID:                uint32(migrationContext.ReplicaServerId),
-		Flavor:                  gomysql.MySQLFlavor,
+		Flavor:                  mysql.FlavorFor(migrationContext.InspectorMySQLVersion),
 		Host:                    connectionConfig.Key.Hostname,
 		Port:                    uint16(connectionConfig.Key.Port),
 		User:                    connectionConfig.User,
@@ -94,13 +93,13 @@ func (gmr *GoMySQLReader) ConnectBinlogStreamer(coordinates mysql.BinlogCoordina
 
 	gmr.currentCoordinatesMutex.Lock()
 	defer gmr.currentCoordinatesMutex.Unlock()
-	gmr.currentCoordinates = coordinates
+	gmr.currentCoordinates = coordinates.Clone()
 	gmr.migrationContext.Log.Infof("Connecting binlog streamer at %+v", coordinates)
 
 	// Start sync with specified GTID set or binlog file and position
 	if gmr.migrationContext.UseGTIDs {
 		coords := coordinates.(*mysql.GTIDBinlogCoordinates)
-		gmr.binlogStreamer, err = gmr.binlogSyncer.StartSyncGTID(coords.GTIDSet)
+		gmr.binlogStreamer, err = gmr.binlogSyncer.StartSyncGTID(coords.GTIDSet.Clone())
 	} else {
 		coords := gmr.currentCoordinates.(*mysql.FileBinlogCoordinates)
 		gmr.binlogStreamer, err = gmr.binlogSyncer.StartSync(gomysql.Position{
@@ -137,8 +136,15 @@ func (gmr *GoMySQLReader) flushTransactionMetrics() {
 	gmr.transactionRowTotal = 0
 }
 
-func (gmr *GoMySQLReader) onGTIDEvent(event *replication.GTIDEvent) {
+func (gmr *GoMySQLReader) onGTIDEvent(gtidEvent gomysql.BinlogGTIDEvent) {
 	gmr.flushTransactionMetrics()
+
+	// Both flavors mark transaction boundaries, but only MySQL GTID events
+	// provide transaction length and parallel replication sequence numbers.
+	event, ok := gtidEvent.(*replication.GTIDEvent)
+	if !ok {
+		return
+	}
 
 	emit := gmr.migrationContext.Metrics
 	if event.TransactionLength > 0 {
@@ -238,25 +244,34 @@ func (gmr *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesChan
 		}
 
 		switch event := ev.Event.(type) {
-		case *replication.GTIDEvent:
+		case *replication.GTIDEvent, *replication.MariadbGTIDEvent:
+			// MySQL emits *GTIDEvent, MariaDB emits *MariadbGTIDEvent; both
+			// implement BinlogGTIDEvent.GTIDNext() returning the GTID about to
+			// be applied. We advance currentCoordinates by merging it into the
+			// running GTID set, regardless of flavor.
 			if !gmr.migrationContext.UseGTIDs {
 				continue
 			}
-			sid, err := uuid.FromBytes(event.SID)
+			gtidEvent, ok := ev.Event.(gomysql.BinlogGTIDEvent)
+			if !ok {
+				return fmt.Errorf("unexpected GTID event type: %T", ev.Event)
+			}
+			nextGTID, err := gtidEvent.GTIDNext()
 			if err != nil {
 				return err
 			}
-			gmr.onGTIDEvent(event)
+			gmr.onGTIDEvent(gtidEvent)
 			gmr.currentCoordinatesMutex.Lock()
 			if gmr.LastTrxCoords != nil {
 				gmr.currentCoordinates = gmr.LastTrxCoords.Clone()
 			}
 			coords := gmr.currentCoordinates.(*mysql.GTIDBinlogCoordinates)
 			if coords.GTIDSet == nil {
-				gtidSet := gomysql.NewMysqlGTIDSet()
-				coords.GTIDSet = &gtidSet
+				coords.GTIDSet = nextGTID
+			} else if err := coords.GTIDSet.Update(nextGTID.String()); err != nil {
+				gmr.currentCoordinatesMutex.Unlock()
+				return err
 			}
-			coords.GTIDSet.AddGTID(sid, event.GNO)
 			gmr.currentCoordinatesMutex.Unlock()
 		case *replication.RotateEvent:
 			if gmr.migrationContext.UseGTIDs {
@@ -272,7 +287,11 @@ func (gmr *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesChan
 				gmr.flushTransactionMetrics()
 			}
 			if gmr.migrationContext.UseGTIDs {
-				gmr.LastTrxCoords = &mysql.GTIDBinlogCoordinates{GTIDSet: event.GSet.(*gomysql.MysqlGTIDSet)}
+				// event.GSet is the full executed GTID set maintained by the
+				// syncer (MysqlGTIDSet or MariadbGTIDSet depending on flavor).
+				if event.GSet != nil {
+					gmr.LastTrxCoords = &mysql.GTIDBinlogCoordinates{GTIDSet: event.GSet}
+				}
 			} else {
 				gmr.LastTrxCoords = gmr.currentCoordinates.Clone()
 			}
