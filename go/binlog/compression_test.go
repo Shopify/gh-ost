@@ -171,7 +171,9 @@ func TestCompressedTransaction(t *testing.T) {
 				compressionTestStream(t, reader, gtid(1))
 			}
 			entries := compressionTestStream(t, reader, payload)
-			require.Len(t, entries, 3)
+			require.Len(t, entries, 4)
+			require.True(t, entries[3].TransactionComplete)
+			require.Nil(t, entries[3].DmlEvent)
 			require.Equal(t, InsertDML, entries[0].DmlEvent.DML)
 			require.Equal(t, UpdateDML, entries[1].DmlEvent.DML)
 			require.Equal(t, DeleteDML, entries[2].DmlEvent.DML)
@@ -218,6 +220,7 @@ func TestCompressedTransaction(t *testing.T) {
 			plain := compressionTestStream(t, reader, ordinary...)
 			require.Len(t, plain, len(entries))
 			for i := range plain {
+				require.Equal(t, entries[i].TransactionComplete, plain[i].TransactionComplete)
 				require.Equal(t, entries[i].DmlEvent, plain[i].DmlEvent)
 			}
 			require.Equal(t, reader.GetCurrentBinlogCoordinates(), reader.LastTrxCoords)
@@ -239,11 +242,28 @@ func TestCompressedTransactionRowFilter(t *testing.T) {
 	require.Equal(t, []string{"ignored", "ignored", "ignored", "testing", "testing", "testing"}, tables)
 	reader := compressionTestReader(false)
 	entries := compressionTestStream(t, reader, payload)
-	require.Len(t, entries, 3)
-	for _, entry := range entries {
+	require.Len(t, entries, 4)
+	for _, entry := range entries[:3] {
 		require.Equal(t, "testing", entry.DmlEvent.TableName)
+		require.False(t, entry.TransactionComplete)
 	}
+	require.True(t, entries[3].TransactionComplete)
 	require.NotNil(t, reader.LastTrxCoords)
+}
+
+func TestFilteredTransactionDoesNotEmitCompletionMarker(t *testing.T) {
+	parser := compressionTestParser(t, func(database, table string) bool { return false })
+	payload := compressionTestPayload(t, parser, compressionTestTransaction("ignored"), 4096)
+	reader := compressionTestReader(false)
+	require.Empty(t, compressionTestStream(t, reader, payload))
+	require.NotNil(t, reader.LastTrxCoords, "reader reconnect progress still advances for filtered transactions")
+
+	// The next relevant transaction must still publish exactly one marker.
+	payload = compressionTestPayload(t, compressionTestParser(t, nil), compressionTestTransaction("testing"), 8192)
+	entries := compressionTestStream(t, reader, payload)
+	require.Len(t, entries, 4)
+	require.True(t, entries[3].TransactionComplete)
+	require.Equal(t, reader.LastTrxCoords, entries[3].Coordinates)
 }
 
 func TestCompressedTransactionRowErrorDoesNotCommit(t *testing.T) {

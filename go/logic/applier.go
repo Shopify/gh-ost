@@ -75,8 +75,9 @@ type Applier struct {
 	finishedMigrating int64
 	name              string
 
-	CurrentCoordinatesMutex sync.Mutex
-	CurrentCoordinates      mysql.BinlogCoordinates
+	CurrentCoordinatesMutex       sync.Mutex
+	CurrentCoordinates            mysql.BinlogCoordinates
+	AppliedTransactionCoordinates mysql.BinlogCoordinates
 
 	LastIterationRangeMutex     sync.Mutex
 	LastIterationRangeMinValues *sql.ColumnValues

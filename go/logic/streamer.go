@@ -40,6 +40,7 @@ type EventsStreamer struct {
 	migrationContext         *base.MigrationContext
 	initialBinlogCoordinates mysql.BinlogCoordinates
 	listeners                [](*BinlogEventListener)
+	transactionListeners     []func(*binlog.BinlogEntry) error
 	listenersMutex           *sync.Mutex
 	eventsChannel            chan *binlog.BinlogEntry
 	binlogReader             *binlog.GoMySQLReader
@@ -80,6 +81,14 @@ func (es *EventsStreamer) AddListener(
 	return nil
 }
 
+// AddTransactionCompleteListener registers a synchronous commit listener.
+// Consumers must also use synchronous DML listeners to preserve queue order.
+func (es *EventsStreamer) AddTransactionCompleteListener(listener func(*binlog.BinlogEntry) error) {
+	es.listenersMutex.Lock()
+	defer es.listenersMutex.Unlock()
+	es.transactionListeners = append(es.transactionListeners, listener)
+}
+
 // shouldDecodeRowsEvent returns true when at least one listener is registered for
 // the table on which the rows event operates. This is used by the binlog parser
 // after it decodes the row event header/table map, but before it decodes row data.
@@ -99,11 +108,18 @@ func (es *EventsStreamer) shouldDecodeRowsEvent(databaseName, tableName string) 
 	return false
 }
 
-// notifyListeners will notify relevant listeners with given DML event. Only
-// listeners registered for changes on the table on which the DML operates are notified.
+// notifyListeners dispatches table-filtered DML or a transaction completion
+// marker. Synchronous listeners run on the same dispatcher to preserve order.
 func (es *EventsStreamer) notifyListeners(binlogEntry *binlog.BinlogEntry) {
 	es.listenersMutex.Lock()
 	defer es.listenersMutex.Unlock()
+
+	if binlogEntry.TransactionComplete {
+		for _, listener := range es.transactionListeners {
+			listener(binlogEntry)
+		}
+		return
+	}
 
 	for _, listener := range es.listeners {
 		listener := listener
@@ -218,7 +234,7 @@ func (es *EventsStreamer) readCurrentMariaDBGTIDCoordinates() error {
 func (es *EventsStreamer) StreamEvents(canStopStreaming func() bool) error {
 	go func() {
 		for binlogEntry := range es.eventsChannel {
-			if binlogEntry.DmlEvent != nil {
+			if binlogEntry.DmlEvent != nil || binlogEntry.TransactionComplete {
 				es.notifyListeners(binlogEntry)
 			}
 		}

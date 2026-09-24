@@ -112,8 +112,10 @@ func TestBinlogTransactionCompressionIntegration(t *testing.T) {
 				t.Fatal("timed out reading compressed transaction")
 			}
 			require.True(t, reader.LastTrxCoords.Equals(end))
-			require.Len(t, entries, 3)
-			insert, update, deleted := <-entries, <-entries, <-entries
+			require.Len(t, entries, 4)
+			insert, update, deleted, commit := <-entries, <-entries, <-entries, <-entries
+			require.True(t, commit.TransactionComplete)
+			require.True(t, commit.Coordinates.Equals(end))
 			require.Equal(t, binlog.InsertDML, insert.DmlEvent.DML)
 			require.Equal(t, binlog.UpdateDML, update.DmlEvent.DML)
 			require.Equal(t, binlog.DeleteDML, deleted.DmlEvent.DML)

@@ -49,6 +49,7 @@ type GoMySQLReader struct {
 	currentCoordinates      mysql.BinlogCoordinates
 	currentCoordinatesMutex *sync.Mutex
 	// LastTrxCoords are the coordinates of the last transaction completely read.
+	// They are for streamer reconnects, not durable applier checkpoints.
 	// For file coordinates, this is the end position of the transaction's XID
 	// event or its enclosing compressed payload.
 	LastTrxCoords mysql.BinlogCoordinates
@@ -57,6 +58,7 @@ type GoMySQLReader struct {
 	transactionRowEventTotal int64
 	transactionRowTotal      int64
 	previousLastCommitted    int64
+	transactionHasRows       bool
 }
 
 func NewGoMySQLReader(migrationContext *base.MigrationContext, rowsEventFilters ...RowsEventFilterFunc) *GoMySQLReader {
@@ -214,6 +216,7 @@ func (gmr *GoMySQLReader) handleRowsEvent(ev *replication.BinlogEvent, rowsEvent
 		// next iteration) or asynchronously (we keep pushing more events)
 		// In reality, reads will be synchronous
 		entriesChannel <- binlogEntry
+		gmr.transactionHasRows = true
 	}
 	if relevant {
 		metrics.RecordBinlogStreamerBlockedOnOutChannel(emit, time.Since(beforeChannel))
@@ -221,7 +224,7 @@ func (gmr *GoMySQLReader) handleRowsEvent(ev *replication.BinlogEvent, rowsEvent
 	return nil
 }
 
-func (gmr *GoMySQLReader) completeTransaction(event *replication.XIDEvent) {
+func (gmr *GoMySQLReader) completeTransaction(event *replication.XIDEvent, entriesChannel chan<- *BinlogEntry) {
 	if !gmr.migrationContext.UseGTIDs {
 		gmr.flushTransactionMetrics()
 	}
@@ -233,6 +236,13 @@ func (gmr *GoMySQLReader) completeTransaction(event *replication.XIDEvent) {
 		// events parsed without the syncer, fall back to the coordinates
 		// already updated by the preceding GTID event.
 		gmr.LastTrxCoords = gmr.GetCurrentBinlogCoordinates()
+	}
+	if gmr.transactionHasRows {
+		entriesChannel <- &BinlogEntry{
+			Coordinates:         gmr.LastTrxCoords.Clone(),
+			TransactionComplete: true,
+		}
+		gmr.transactionHasRows = false
 	}
 }
 
@@ -299,7 +309,7 @@ func (gmr *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesChan
 			gmr.migrationContext.Log.Infof("rotate to next log from %s:%d to %s", coords.LogFile, int64(ev.Header.LogPos), event.NextLogName)
 			gmr.currentCoordinatesMutex.Unlock()
 		case *replication.XIDEvent:
-			gmr.completeTransaction(event)
+			gmr.completeTransaction(event, entriesChannel)
 		case *replication.RowsEvent:
 			if err := gmr.handleRowsEvent(ev, event, entriesChannel); err != nil {
 				return err
@@ -315,7 +325,7 @@ func (gmr *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesChan
 						return err
 					}
 				case *replication.XIDEvent:
-					gmr.completeTransaction(nestedEvent)
+					gmr.completeTransaction(nestedEvent, entriesChannel)
 				}
 			}
 		}
