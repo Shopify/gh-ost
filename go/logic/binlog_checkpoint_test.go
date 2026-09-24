@@ -20,7 +20,7 @@ import (
 // queueCheckpointTestEvents uses the production reader, dispatcher and listeners,
 // but leaves consumption of the apply queue under the test's control.
 //
-//nolint:contextcheck // Streamer APIs use MigrationContext; the deadline below closes the context-free reader.
+//nolint:contextcheck // Streamer APIs use MigrationContext; the test deadline closes the reader.
 func queueCheckpointTestEvents(t *testing.T, ctx context.Context, migrationContext *base.MigrationContext, migrator *Migrator, start, end mysql.BinlogCoordinates) {
 	t.Helper()
 	reader := binlog.NewGoMySQLReader(migrationContext, func(database, table string) bool {
@@ -142,8 +142,16 @@ func TestBinlogCheckpointWaitsForTransactionIntegration(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, transaction := range transactions {
-		for _, useGTIDs := range []bool{false, true} {
-			t.Run(fmt.Sprintf("compression=%s/GTID=%t", transaction.name, useGTIDs), func(t *testing.T) {
+		for _, mode := range []struct {
+			useGTIDs bool
+			cancelAt string
+		}{
+			{false, "none"}, {true, "none"},
+			{false, "apply"}, {true, "apply"},
+			{false, "insert"}, {true, "insert"},
+		} {
+			useGTIDs := mode.useGTIDs
+			t.Run(fmt.Sprintf("compression=%s/GTID=%t/cancel=%s", transaction.name, useGTIDs, mode.cancelAt), func(t *testing.T) {
 				migrationContext := newTestMigrationContext()
 				defer migrationContext.CancelContext()
 				migrationContext.Checkpoint = true
@@ -187,8 +195,9 @@ func TestBinlogCheckpointWaitsForTransactionIntegration(t *testing.T) {
 					IterationRangeMin: migrator.applier.LastIterationRangeMinValues.Clone(),
 					IterationRangeMax: migrator.applier.LastIterationRangeMaxValues.Clone(),
 				}
-				seedID, err := migrator.applier.WriteCheckpoint(seed)
+				seedID, err := migrator.applier.WriteCheckpoint(ctx, seed)
 				require.NoError(t, err)
+				migrator.applier.AppliedTransactionCoordinates = start.Clone()
 				queueCheckpointTestEvents(t, ctx, migrationContext, migrator, start, end)
 				require.Len(t, migrator.applyEventsQueue, 4)
 				first := <-migrator.applyEventsQueue
@@ -206,6 +215,18 @@ func TestBinlogCheckpointWaitsForTransactionIntegration(t *testing.T) {
 					require.True(t, stored.LastTrxCoords.Equals(start))
 				}
 				assertCheckpointBlocked()
+				switch mode.cancelAt {
+				case "apply":
+					assertCanceledTransactionCheckpoint(t, ctx, migrationContext, migrator, seedID)
+					return
+				case "insert":
+					for len(migrator.applyEventsQueue) > 0 {
+						require.NoError(t, migrator.onApplyEventStruct(<-migrator.applyEventsQueue))
+					}
+					require.True(t, migrator.applier.AppliedTransactionCoordinates.Equals(end))
+					assertCanceledCheckpointInsert(t, ctx, migrationContext, migrator, seedID)
+					return
+				}
 
 				// Simulate a crash after the first applied row: discard volatile
 				// queue contents, then restart from the last persisted checkpoint.
@@ -223,7 +244,19 @@ func TestBinlogCheckpointWaitsForTransactionIntegration(t *testing.T) {
 					require.NoError(t, migrator.onApplyEventStruct(row))
 				}
 				// Even the final row cannot independently acknowledge its commit.
-				require.Nil(t, migrator.applier.AppliedTransactionCoordinates)
+				require.True(t, migrator.applier.AppliedTransactionCoordinates.Equals(start))
+				if !useGTIDs && transaction.name == "OFF" {
+					// Sample a real row-event position P between the previous commit A
+					// and this transaction's XID B. A must block; B must be persisted
+					// rather than P once its marker is acknowledged.
+					sampled := first.coords.Clone()
+					require.True(t, start.SmallerThan(sampled))
+					require.True(t, sampled.SmallerThan(end))
+					reader := binlog.NewGoMySQLReader(migrationContext, nil)
+					defer reader.Close()
+					require.NoError(t, reader.ConnectBinlogStreamer(sampled))
+					migrator.eventsStreamer.binlogReader = reader
+				}
 				assertCheckpointBlocked()
 				marker := <-migrator.applyEventsQueue
 				require.True(t, marker.transactionComplete)

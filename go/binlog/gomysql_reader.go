@@ -17,8 +17,6 @@ import (
 
 	"time"
 
-	"context"
-
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 )
@@ -215,7 +213,9 @@ func (gmr *GoMySQLReader) handleRowsEvent(ev *replication.BinlogEvent, rowsEvent
 		// decides whether action is taken synchronously (meaning we wait before
 		// next iteration) or asynchronously (we keep pushing more events)
 		// In reality, reads will be synchronous
-		entriesChannel <- binlogEntry
+		if err := base.SendWithContext(gmr.migrationContext.GetContext(), entriesChannel, binlogEntry); err != nil {
+			return err
+		}
 		gmr.transactionHasRows = true
 	}
 	if relevant {
@@ -224,32 +224,38 @@ func (gmr *GoMySQLReader) handleRowsEvent(ev *replication.BinlogEvent, rowsEvent
 	return nil
 }
 
-func (gmr *GoMySQLReader) completeTransaction(event *replication.XIDEvent, entriesChannel chan<- *BinlogEntry) {
+func (gmr *GoMySQLReader) completeTransaction(event *replication.XIDEvent, entriesChannel chan<- *BinlogEntry) error {
 	if !gmr.migrationContext.UseGTIDs {
 		gmr.flushTransactionMetrics()
 	}
+	var coords mysql.BinlogCoordinates
 	if gmr.migrationContext.UseGTIDs && event.GSet != nil {
-		coords := &mysql.GTIDBinlogCoordinates{GTIDSet: event.GSet}
-		gmr.LastTrxCoords = coords.Clone()
+		coords = (&mysql.GTIDBinlogCoordinates{GTIDSet: event.GSet}).Clone()
 	} else {
 		// File positions use the current outer event's coordinates. For GTID
 		// events parsed without the syncer, fall back to the coordinates
 		// already updated by the preceding GTID event.
-		gmr.LastTrxCoords = gmr.GetCurrentBinlogCoordinates()
+		coords = gmr.GetCurrentBinlogCoordinates()
 	}
 	if gmr.transactionHasRows {
-		entriesChannel <- &BinlogEntry{
-			Coordinates:         gmr.LastTrxCoords.Clone(),
+		marker := &BinlogEntry{
+			Coordinates:         coords.Clone(),
 			TransactionComplete: true,
+		}
+		if err := base.SendWithContext(gmr.migrationContext.GetContext(), entriesChannel, marker); err != nil {
+			return err
 		}
 		gmr.transactionHasRows = false
 	}
+	// Reconnect only after all rows and their completion marker were delivered.
+	gmr.LastTrxCoords = coords
+	return nil
 }
 
 // StreamEvents
 func (gmr *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesChannel chan<- *BinlogEntry) error {
 	for !canStopStreaming() {
-		ev, err := gmr.binlogStreamer.GetEvent(context.Background())
+		ev, err := gmr.binlogStreamer.GetEvent(gmr.migrationContext.GetContext())
 		if err != nil {
 			return err
 		}
@@ -309,7 +315,9 @@ func (gmr *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesChan
 			gmr.migrationContext.Log.Infof("rotate to next log from %s:%d to %s", coords.LogFile, int64(ev.Header.LogPos), event.NextLogName)
 			gmr.currentCoordinatesMutex.Unlock()
 		case *replication.XIDEvent:
-			gmr.completeTransaction(event, entriesChannel)
+			if err := gmr.completeTransaction(event, entriesChannel); err != nil {
+				return err
+			}
 		case *replication.RowsEvent:
 			if err := gmr.handleRowsEvent(ev, event, entriesChannel); err != nil {
 				return err
@@ -325,7 +333,9 @@ func (gmr *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesChan
 						return err
 					}
 				case *replication.XIDEvent:
-					gmr.completeTransaction(nestedEvent, entriesChannel)
+					if err := gmr.completeTransaction(nestedEvent, entriesChannel); err != nil {
+						return err
+					}
 				}
 			}
 		}

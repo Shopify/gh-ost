@@ -1,6 +1,9 @@
 package logic
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -19,12 +22,12 @@ func TestTransactionMarkersFollowSynchronousDMLListeners(t *testing.T) {
 	require.NoError(t, migrator.addDMLEventsListener())
 	coords := mysql.NewFileBinlogCoordinates("mysql-bin.000001", 1234)
 	for i := 0; i < 3; i++ {
-		streamer.notifyListeners(&binlog.BinlogEntry{
+		require.NoError(t, streamer.notifyListeners(&binlog.BinlogEntry{
 			Coordinates: coords,
 			DmlEvent:    binlog.NewBinlogDMLEvent(ctx.DatabaseName, ctx.OriginalTableName, binlog.InsertDML),
-		})
+		}))
 	}
-	streamer.notifyListeners(&binlog.BinlogEntry{Coordinates: coords, TransactionComplete: true})
+	require.NoError(t, streamer.notifyListeners(&binlog.BinlogEntry{Coordinates: coords, TransactionComplete: true}))
 	require.Len(t, migrator.applyEventsQueue, 4)
 	require.Nil(t, migrator.applier.AppliedTransactionCoordinates)
 	for i := 0; i < 3; i++ {
@@ -35,6 +38,70 @@ func TestTransactionMarkersFollowSynchronousDMLListeners(t *testing.T) {
 	marker := <-migrator.applyEventsQueue
 	require.True(t, marker.transactionComplete)
 	require.Nil(t, marker.dmlEvent)
+}
+
+func TestTransactionMarkerRejectedAfterAbort(t *testing.T) {
+	for _, abortErr := range []error{context.Canceled, errors.New("migration aborted")} {
+		t.Run(abortErr.Error(), func(t *testing.T) {
+			ctx := newTestMigrationContext()
+			defer ctx.CancelContext()
+			migrator := NewMigrator(ctx, "test")
+			migrator.applier = NewApplier(ctx)
+			previous := mysql.NewFileBinlogCoordinates("mysql-bin.000001", 100)
+			migrator.applier.AppliedTransactionCoordinates = previous.Clone()
+			marker := &applyEventStruct{coords: mysql.NewFileBinlogCoordinates("mysql-bin.000001", 200), transactionComplete: true}
+			if !errors.Is(abortErr, context.Canceled) {
+				ctx.SetAbortError(abortErr)
+			}
+			ctx.CancelContext()
+			require.ErrorIs(t, migrator.onApplyEventStruct(marker), abortErr)
+			require.True(t, previous.Equals(migrator.applier.AppliedTransactionCoordinates))
+		})
+	}
+}
+
+func TestFailedSynchronousListenerStopsTransactionDelivery(t *testing.T) {
+	for _, failMarker := range []bool{false, true} {
+		t.Run(fmt.Sprintf("marker=%t", failMarker), func(t *testing.T) {
+			ctx := newTestMigrationContext()
+			defer ctx.CancelContext()
+			streamer := NewEventsStreamer(ctx)
+			failure := errors.New("listener rejected event")
+			called := 0
+			fail := func(*binlog.BinlogEntry) error { called++; return failure }
+			unexpected := func(*binlog.BinlogEntry) error { t.Error("delivered after listener failure"); return nil }
+			entry := &binlog.BinlogEntry{TransactionComplete: failMarker}
+			if failMarker {
+				streamer.AddTransactionCompleteListener(fail)
+			} else {
+				entry.DmlEvent = binlog.NewBinlogDMLEvent(ctx.DatabaseName, ctx.OriginalTableName, binlog.DeleteDML)
+				require.NoError(t, streamer.AddListener(false, ctx.DatabaseName, ctx.OriginalTableName, fail))
+				require.NoError(t, streamer.AddListener(false, ctx.DatabaseName, ctx.OriginalTableName, unexpected))
+			}
+			streamer.AddTransactionCompleteListener(unexpected)
+			require.ErrorIs(t, streamer.notifyListeners(entry), failure)
+			require.ErrorIs(t, ctx.GetAbortError(), failure)
+			require.ErrorIs(t, ctx.GetContext().Err(), context.Canceled)
+			require.ErrorIs(t, streamer.notifyListeners(&binlog.BinlogEntry{TransactionComplete: true}), failure)
+			require.Equal(t, 1, called)
+		})
+	}
+}
+
+func TestCanceledDispatcherRejectsReadyQueue(t *testing.T) {
+	ctx := newTestMigrationContext()
+	migrator := NewMigrator(ctx, "test")
+	migrator.eventsStreamer = NewEventsStreamer(ctx)
+	require.NoError(t, migrator.addDMLEventsListener())
+	ctx.CancelContext()
+	coords := mysql.NewFileBinlogCoordinates("mysql-bin.000001", 100)
+	for _, entry := range []*binlog.BinlogEntry{
+		{Coordinates: coords, DmlEvent: binlog.NewBinlogDMLEvent(ctx.DatabaseName, ctx.OriginalTableName, binlog.DeleteDML)},
+		{Coordinates: coords, TransactionComplete: true},
+	} {
+		require.ErrorIs(t, migrator.eventsStreamer.notifyListeners(entry), context.Canceled)
+	}
+	require.Empty(t, migrator.applyEventsQueue)
 }
 
 func TestTransactionMarkerClonesGTIDCoordinates(t *testing.T) {

@@ -1766,6 +1766,11 @@ func (mgtr *Migrator) iterateChunks() error {
 }
 
 func (mgtr *Migrator) onApplyEventStruct(eventStruct *applyEventStruct) error {
+	// Cancellation may happen after the worker's loop check, while throttled.
+	// A standalone marker must not bypass the abort checks used by SQL tasks.
+	if err := mgtr.checkAbort(); err != nil {
+		return err
+	}
 	handleNonDMLEventStruct := func(eventStruct *applyEventStruct) error {
 		if eventStruct.transactionComplete {
 			mgtr.applier.CurrentCoordinatesMutex.Lock()
@@ -1836,6 +1841,17 @@ func (mgtr *Migrator) onApplyEventStruct(eventStruct *applyEventStruct) error {
 // It samples reader progress and waits for an applied transaction boundary
 // covering that progress. Row/batch progress alone is not a safe resume point.
 func (mgtr *Migrator) Checkpoint(ctx context.Context) (*Checkpoint, error) {
+	if err := mgtr.checkAbort(); err != nil {
+		return nil, err
+	}
+	// Observe both the caller's deadline and migration cancellation, including
+	// while executing the checkpoint INSERT rather than only while polling.
+	ctx, cancel := context.WithCancel(ctx)
+	//nolint:contextcheck // Merge migration cancellation with the caller-derived checkpoint context.
+	stopCancel := context.AfterFunc(mgtr.migrationContext.GetContext(), cancel)
+	defer stopCancel()
+	defer cancel()
+
 	coords := mgtr.eventsStreamer.GetCurrentBinlogCoordinates()
 	mgtr.applier.LastIterationRangeMutex.Lock()
 	if mgtr.applier.LastIterationRangeMaxValues == nil || mgtr.applier.LastIterationRangeMinValues == nil {
@@ -1852,6 +1868,9 @@ func (mgtr *Migrator) Checkpoint(ctx context.Context) (*Checkpoint, error) {
 	mgtr.applier.LastIterationRangeMutex.Unlock()
 
 	for {
+		if err := mgtr.checkAbort(); err != nil {
+			return nil, err
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -1861,7 +1880,7 @@ func (mgtr *Migrator) Checkpoint(ctx context.Context) (*Checkpoint, error) {
 			// Persist the acknowledged commit boundary, not the sampled reader
 			// position, which may be inside a row event or transaction.
 			chk.LastTrxCoords = applied.Clone()
-			id, err := mgtr.applier.WriteCheckpoint(chk)
+			id, err := mgtr.applier.WriteCheckpoint(ctx, chk)
 			chk.Id = id
 			mgtr.applier.CurrentCoordinatesMutex.Unlock()
 			return chk, err
@@ -1901,7 +1920,7 @@ func (mgtr *Migrator) CheckpointAfterCutOver() (*Checkpoint, error) {
 	}
 	mgtr.applier.LastIterationRangeMutex.Unlock()
 
-	id, err := mgtr.applier.WriteCheckpoint(chk)
+	id, err := mgtr.applier.WriteCheckpoint(mgtr.migrationContext.GetContext(), chk)
 	chk.Id = id
 	return chk, err
 }
@@ -1913,7 +1932,15 @@ func (mgtr *Migrator) checkpointLoop() {
 	}
 	checkpointInterval := time.Duration(mgtr.migrationContext.CheckpointIntervalSeconds) * time.Second
 	ticker := time.NewTicker(checkpointInterval)
-	for t := range ticker.C {
+	defer ticker.Stop()
+	migrationCtx := mgtr.migrationContext.GetContext()
+	for {
+		var t time.Time
+		select {
+		case <-migrationCtx.Done():
+			return
+		case t = <-ticker.C:
+		}
 		if atomic.LoadInt64(&mgtr.finishedMigrating) > 0 || atomic.LoadInt64(&mgtr.migrationContext.CutOverCompleteFlag) > 0 {
 			return
 		}
@@ -1921,7 +1948,7 @@ func (mgtr *Migrator) checkpointLoop() {
 			continue
 		}
 		mgtr.migrationContext.Log.Infof("starting checkpoint at %+v", t)
-		ctx, cancel := context.WithTimeout(context.Background(), checkpointTimeout)
+		ctx, cancel := context.WithTimeout(migrationCtx, checkpointTimeout)
 		chk, err := mgtr.Checkpoint(ctx)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {

@@ -16,6 +16,9 @@ import (
 )
 
 func TestBinlogTransactionCompressionIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires MySQL 8.0 with transaction compression")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	container, err := testmysql.Run(ctx, testMysqlContainerImage,
@@ -97,7 +100,6 @@ func TestBinlogTransactionCompressionIntegration(t *testing.T) {
 			require.NoError(t, reader.ConnectBinlogStreamer(start))
 			entries := make(chan *binlog.BinlogEntry, 16)
 			done := make(chan error, 1)
-			//nolint:contextcheck // StreamEvents has no context parameter; timeout handling below closes the reader.
 			go func() {
 				done <- reader.StreamEvents(func() bool {
 					return reader.LastTrxCoords != nil && reader.LastTrxCoords.Equals(end)
