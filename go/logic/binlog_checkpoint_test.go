@@ -66,7 +66,7 @@ func queueCheckpointTestEvents(t *testing.T, ctx context.Context, migrationConte
 //nolint:contextcheck // Migrator APIs use MigrationContext's internal context; SQL/checkpoint calls use the test deadline.
 func TestBinlogCheckpointWaitsForTransactionIntegration(t *testing.T) {
 	if testing.Short() {
-		t.Skip("requires MySQL 8.0")
+		t.Skip("requires MySQL 8.0 with transaction compression")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -107,7 +107,7 @@ func TestBinlogCheckpointWaitsForTransactionIntegration(t *testing.T) {
 		startGTID, endGTID *mysql.GTIDBinlogCoordinates
 	}
 	var transactions []transaction
-	for _, compression := range []string{"OFF"} {
+	for _, compression := range []string{"ON", "OFF"} {
 		_, err := conn.ExecContext(ctx, "SET SESSION binlog_transaction_compression="+compression)
 		require.NoError(t, err)
 		startFile, startGTID := status()
@@ -125,6 +125,19 @@ func TestBinlogCheckpointWaitsForTransactionIntegration(t *testing.T) {
 		endFile, endGTID := status()
 		transactions = append(transactions, transaction{compression, startFile, endFile, startGTID, endGTID})
 	}
+	// Verify that the compressed case really contains a payload wrapper.
+	rows, err := conn.QueryContext(ctx, fmt.Sprintf("SHOW BINLOG EVENTS IN '%s' FROM %d", transactions[0].startFile.LogFile, transactions[0].startFile.LogPos))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rows.Close()) }()
+	compressed := false
+	for rows.Next() {
+		var file, eventType, info string
+		var pos, serverID, endPos uint64
+		require.NoError(t, rows.Scan(&file, &pos, &eventType, &serverID, &endPos, &info))
+		compressed = compressed || eventType == "Transaction_payload"
+	}
+	require.NoError(t, rows.Err())
+	require.True(t, compressed)
 	config, err := getTestConnectionConfig(ctx, container)
 	require.NoError(t, err)
 
