@@ -136,8 +136,15 @@ func (gmr *GoMySQLReader) flushTransactionMetrics() {
 	gmr.transactionRowTotal = 0
 }
 
-func (gmr *GoMySQLReader) onGTIDEvent(event *replication.GTIDEvent) {
+func (gmr *GoMySQLReader) onGTIDEvent(gtidEvent gomysql.BinlogGTIDEvent) {
 	gmr.flushTransactionMetrics()
+
+	// Both flavors mark transaction boundaries, but only MySQL GTID events
+	// provide transaction length and parallel replication sequence numbers.
+	event, ok := gtidEvent.(*replication.GTIDEvent)
+	if !ok {
+		return
+	}
 
 	emit := gmr.migrationContext.Metrics
 	if event.TransactionLength > 0 {
@@ -253,7 +260,7 @@ func (gmr *GoMySQLReader) StreamEvents(canStopStreaming func() bool, entriesChan
 			if err != nil {
 				return err
 			}
-			gmr.onGTIDEvent(event)
+			gmr.onGTIDEvent(gtidEvent)
 			gmr.currentCoordinatesMutex.Lock()
 			if gmr.LastTrxCoords != nil {
 				gmr.currentCoordinates = gmr.LastTrxCoords.Clone()
