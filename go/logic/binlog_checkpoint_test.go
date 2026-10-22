@@ -23,12 +23,10 @@ import (
 //nolint:contextcheck // Streamer APIs use MigrationContext; the test deadline closes the reader.
 func queueCheckpointTestEvents(t *testing.T, ctx context.Context, migrationContext *base.MigrationContext, migrator *Migrator, start, end mysql.BinlogCoordinates) {
 	t.Helper()
-	reader := binlog.NewGoMySQLReader(migrationContext, func(database, table string) bool {
-		return database == testMysqlDatabase && table == testMysqlTableName
-	})
-	defer reader.Close()
-	require.NoError(t, reader.ConnectBinlogStreamer(start))
 	streamer := NewEventsStreamer(migrationContext)
+	reader, err := binlog.NewCanalReader(migrationContext, start, streamer.eventsChannel)
+	require.NoError(t, err)
+	defer reader.Close()
 	streamer.binlogReader = reader
 	migrator.eventsStreamer = streamer
 	require.NoError(t, migrator.addDMLEventsListener())
@@ -43,7 +41,8 @@ func queueCheckpointTestEvents(t *testing.T, ctx context.Context, migrationConte
 	done := make(chan error, 1)
 	go func() {
 		done <- streamer.StreamEvents(func() bool {
-			return reader.LastTrxCoords != nil && reader.LastTrxCoords.Equals(end)
+			last := reader.Handler.LastTransactionCoordinates()
+			return last != nil && last.Equals(end)
 		})
 	}()
 	select {
@@ -252,9 +251,9 @@ func TestBinlogCheckpointWaitsForTransactionIntegration(t *testing.T) {
 					sampled := first.coords.Clone()
 					require.True(t, start.SmallerThan(sampled))
 					require.True(t, sampled.SmallerThan(end))
-					reader := binlog.NewGoMySQLReader(migrationContext, nil)
+					reader, err := binlog.NewCanalReader(migrationContext, sampled, migrator.eventsStreamer.eventsChannel)
+					require.NoError(t, err)
 					defer reader.Close()
-					require.NoError(t, reader.ConnectBinlogStreamer(sampled))
 					migrator.eventsStreamer.binlogReader = reader
 				}
 				assertCheckpointBlocked()

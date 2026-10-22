@@ -41,6 +41,7 @@ func TestBinlogTransactionCompressionIntegration(t *testing.T) {
 		"SET SESSION binlog_transaction_compression=ON",
 		"SET SESSION time_zone='+00:00'",
 		"CREATE TABLE testing (id INT PRIMARY KEY, amount DECIMAL(5,2), created_at TIMESTAMP, padding TEXT)",
+		"CREATE TABLE unrelated (id INT PRIMARY KEY)",
 	} {
 		_, err := conn.ExecContext(ctx, query)
 		require.NoError(t, err)
@@ -54,6 +55,8 @@ func TestBinlogTransactionCompressionIntegration(t *testing.T) {
 		return mysql.NewFileBinlogCoordinates(file, pos), coords
 	}
 	startFile, startGTID := status()
+	_, err = conn.ExecContext(ctx, "INSERT INTO unrelated VALUES (1)")
+	require.NoError(t, err)
 	tx, err := conn.BeginTx(ctx, nil)
 	require.NoError(t, err)
 	for _, query := range []string{
@@ -89,21 +92,20 @@ func TestBinlogTransactionCompressionIntegration(t *testing.T) {
 			migrationContext := newTestMigrationContext()
 			migrationContext.UseGTIDs = useGTIDs
 			migrationContext.InspectorConnectionConfig = config
-			reader := binlog.NewGoMySQLReader(migrationContext, func(database, table string) bool {
-				return database == testMysqlDatabase && table == testMysqlTableName
-			})
-			defer reader.Close()
 			start, end := startFile.Clone(), endFile.Clone()
 			if useGTIDs {
 				start, end = startGTID.Clone(), endGTID.Clone()
 			}
-			require.NoError(t, reader.ConnectBinlogStreamer(start))
 			entries := make(chan *binlog.BinlogEntry, 16)
+			reader, err := binlog.NewCanalReader(migrationContext, start, entries)
+			require.NoError(t, err)
+			defer reader.Close()
 			done := make(chan error, 1)
 			go func() {
 				done <- reader.StreamEvents(func() bool {
-					return reader.LastTrxCoords != nil && reader.LastTrxCoords.Equals(end)
-				}, entries)
+					last := reader.Handler.LastTransactionCoordinates()
+					return last != nil && last.Equals(end)
+				})
 			}()
 			select {
 			case err := <-done:
@@ -113,7 +115,7 @@ func TestBinlogTransactionCompressionIntegration(t *testing.T) {
 				<-done
 				t.Fatal("timed out reading compressed transaction")
 			}
-			require.True(t, reader.LastTrxCoords.Equals(end))
+			require.Equal(t, end.DisplayString(), reader.Handler.LastTransactionCoordinates().DisplayString())
 			require.Len(t, entries, 4)
 			insert, update, deleted, commit := <-entries, <-entries, <-entries, <-entries
 			require.True(t, commit.TransactionComplete)
@@ -127,7 +129,7 @@ func TestBinlogTransactionCompressionIntegration(t *testing.T) {
 			require.Equal(t, decimal.RequireFromString("456.78"), update.DmlEvent.NewColumnValues.AbstractValues()[1])
 			require.Equal(t, update.DmlEvent.NewColumnValues, deleted.DmlEvent.WhereColumnValues)
 			for _, entry := range []*binlog.BinlogEntry{insert, update, deleted} {
-				require.True(t, entry.Coordinates.Equals(end))
+				require.Equal(t, end.DisplayString(), entry.Coordinates.DisplayString())
 			}
 		})
 	}

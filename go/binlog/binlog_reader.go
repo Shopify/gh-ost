@@ -5,9 +5,12 @@
 
 package binlog
 
-// BinlogReader is a general interface whose implementations can choose their methods of reading
-// a binary log file and parsing it into binlog entries
+import "github.com/github/gh-ost/go/mysql"
+
+// BinlogReader streams rows and transaction boundaries in order.
 type BinlogReader interface {
-	StreamEvents(canStopStreaming func() bool, entriesChannel chan<- *BinlogEntry) error
-	Reconnect() error
+	StreamEvents(canStopStreaming func() bool) error
+	GetCurrentBinlogCoordinates() mysql.BinlogCoordinates
+	LastTransactionCoordinates() mysql.BinlogCoordinates
+	Close()
 }

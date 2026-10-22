@@ -16,6 +16,7 @@ type BinlogEntry struct {
 	Coordinates         mysql.BinlogCoordinates
 	DmlEvent            *BinlogDMLEvent
 	TransactionComplete bool
+	DeliveryAck         chan struct{}
 }
 
 // NewBinlogEntryAt creates an empty, ready to go BinlogEntry object

@@ -43,7 +43,7 @@ type EventsStreamer struct {
 	transactionListeners     []func(*binlog.BinlogEntry) error
 	listenersMutex           *sync.Mutex
 	eventsChannel            chan *binlog.BinlogEntry
-	binlogReader             *binlog.GoMySQLReader
+	binlogReader             *binlog.CanalReader
 	name                     string
 }
 
@@ -180,11 +180,12 @@ func (es *EventsStreamer) InitDBConnections() (err error) {
 
 // initBinlogReader creates and connects the reader: we hook up to a MySQL server as a replica
 func (es *EventsStreamer) initBinlogReader(binlogCoordinates mysql.BinlogCoordinates) error {
-	goMySQLReader := binlog.NewGoMySQLReader(es.migrationContext, es.shouldDecodeRowsEvent)
-	if err := goMySQLReader.ConnectBinlogStreamer(binlogCoordinates); err != nil {
+	reader, err := binlog.NewCanalReader(es.migrationContext, binlogCoordinates, es.eventsChannel)
+	if err != nil {
 		return err
 	}
-	es.binlogReader = goMySQLReader
+	reader.EnableDeliveryAck()
+	es.binlogReader = reader
 	return nil
 }
 
@@ -259,10 +260,15 @@ func (es *EventsStreamer) StreamEvents(canStopStreaming func() bool) error {
 				if !ok {
 					return
 				}
+				var dispatchErr error
 				if binlogEntry.DmlEvent != nil || binlogEntry.TransactionComplete {
-					if err := es.notifyListeners(binlogEntry); err != nil {
-						return
-					}
+					dispatchErr = es.notifyListeners(binlogEntry)
+				}
+				if binlogEntry.DeliveryAck != nil {
+					close(binlogEntry.DeliveryAck)
+				}
+				if dispatchErr != nil {
+					return
 				}
 			}
 		}
@@ -284,7 +290,7 @@ func (es *EventsStreamer) StreamEvents(canStopStreaming func() bool) error {
 		// We will reconnect the binlog streamer at the coordinates
 		// of the last trx that was read completely from the streamer.
 		// Since row event application is idempotent, it's OK if we reapply some events.
-		if err := es.binlogReader.StreamEvents(canStopStreaming, es.eventsChannel); err != nil {
+		if err := es.binlogReader.StreamEvents(canStopStreaming); err != nil {
 			if abortErr := es.migrationContext.GetAbortError(); abortErr != nil {
 				return abortErr
 			}
@@ -305,8 +311,8 @@ func (es *EventsStreamer) StreamEvents(canStopStreaming func() bool) error {
 			}
 
 			// Reposition at same coordinates
-			if es.binlogReader.LastTrxCoords != nil {
-				reconnectCoords = es.binlogReader.LastTrxCoords.Clone()
+			if last := es.binlogReader.LastTransactionCoordinates(); last != nil {
+				reconnectCoords = last
 			} else {
 				reconnectCoords = es.initialBinlogCoordinates.Clone()
 			}
@@ -317,7 +323,7 @@ func (es *EventsStreamer) StreamEvents(canStopStreaming func() bool) error {
 			}
 
 			es.migrationContext.Log.Infof("Reconnecting EventsStreamer... Will resume at %+v", reconnectCoords)
-			_ = es.binlogReader.Close()
+			es.binlogReader.Close()
 			if err := es.initBinlogReader(reconnectCoords); err != nil {
 				return err
 			}
@@ -326,9 +332,9 @@ func (es *EventsStreamer) StreamEvents(canStopStreaming func() bool) error {
 }
 
 func (es *EventsStreamer) Close() (err error) {
-	err = es.binlogReader.Close()
-	es.migrationContext.Log.Infof("Closed streamer connection. err=%+v", err)
-	return err
+	es.binlogReader.Close()
+	es.migrationContext.Log.Infof("Closed streamer connection")
+	return nil
 }
 
 func (es *EventsStreamer) Teardown() {

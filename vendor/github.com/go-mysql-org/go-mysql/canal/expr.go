@@ -1,0 +1,49 @@
+package canal
+
+import (
+	"io"
+
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/charset"
+	"github.com/pingcap/tidb/pkg/parser/format"
+)
+
+func init() {
+	ast.NewValueExpr = newValueExpr
+	ast.NewParamMarkerExpr = newParamExpr
+	ast.NewDecimal = func(_ string) (any, error) {
+		return nil, nil
+	}
+	ast.NewHexLiteral = func(_ string) (any, error) {
+		return nil, nil
+	}
+	ast.NewBitLiteral = func(_ string) (any, error) {
+		return nil, nil
+	}
+}
+
+type paramExpr struct {
+	valueExpr
+}
+
+func newParamExpr(_ int) ast.ParamMarkerExpr {
+	return &paramExpr{}
+}
+func (pe *paramExpr) SetOrder(o int) {}
+
+type valueExpr struct {
+	ast.TexprNode
+}
+
+func newValueExpr(_ any, _ string, _ string) ast.ValueExpr          { return &valueExpr{} }
+func (ve *valueExpr) SetValue(val any)                              {}
+func (ve *valueExpr) GetValue() any                                 { return nil }
+func (ve *valueExpr) GetDatumString() string                        { return "" }
+func (ve *valueExpr) GetString() string                             { return "" }
+func (ve *valueExpr) GetProjectionOffset() int                      { return 0 }
+func (ve *valueExpr) SetProjectionOffset(offset int)                {}
+func (ve *valueExpr) Restore(ctx *format.RestoreCtx) error          { return nil }
+func (ve *valueExpr) Accept(v ast.Visitor) (node ast.Node, ok bool) { return node, ok }
+func (ve *valueExpr) Text() string                                  { return "" }
+func (ve *valueExpr) SetText(enc charset.Encoding, text string)     {}
+func (ve *valueExpr) Format(w io.Writer)                            {}
