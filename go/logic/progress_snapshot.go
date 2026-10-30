@@ -52,7 +52,7 @@ func (mgtr *Migrator) migrationProgressSnapshot() migrationProgressSnapshot {
 		rowsEstimate:           rowsEstimate,
 		progressPct:            progressPct,
 		dmlApplied:             atomic.LoadInt64(&mgtr.migrationContext.TotalDMLEventsApplied),
-		applyEventsBacklog:     len(mgtr.applyEventsQueue),
+		applyEventsBacklog:     len(mgtr.applyEventsQueue) + int(atomic.LoadInt64(&mgtr.pendingThrottledEvent)),
 		applyEventsCapacity:    cap(mgtr.applyEventsQueue),
 		state:                  state,
 		eta:                    eta,

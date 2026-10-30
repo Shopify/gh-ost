@@ -73,6 +73,10 @@ func TestMigratorOnChangelogEvent(t *testing.T) {
 				NewColumnValues: columnValues},
 			Coordinates: mysql.NewFileBinlogCoordinates("mysql-bin.000004", int64(4)),
 		}))
+		event := <-migrator.applyEventsQueue
+		require.True(t, event.heartbeat)
+		require.True(t, event.isBookkeeping())
+		require.NoError(t, migrator.onApplyEventStruct(event))
 	})
 
 	t.Run("state-AllEventsUpToLockProcessed", func(t *testing.T) {
@@ -286,7 +290,9 @@ func TestMigratorHeartbeatDoesNotAdvancePastUnappliedDML(t *testing.T) {
 	require.NotNil(t, firstQueued.dmlEvent, "first queued event must be the DML")
 	require.Nil(t, firstQueued.writeFunc, "first queued event must not be a sentinel")
 	require.Nil(t, secondQueued.dmlEvent, "second queued event must not be a DML")
-	require.NotNil(t, secondQueued.writeFunc, "second queued event must be the heartbeat sentinel")
+	require.True(t, secondQueued.heartbeat, "second queued event must be the heartbeat sentinel")
+	require.True(t, secondQueued.isBookkeeping())
+	require.True(t, secondQueued.coords.Equals(heartbeatCoords))
 }
 
 func TestMigratorValidateStatement(t *testing.T) {
