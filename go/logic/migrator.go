@@ -19,8 +19,12 @@ import (
 	"github.com/github/gh-ost/go/base"
 	"github.com/github/gh-ost/go/binlog"
 	"github.com/github/gh-ost/go/metrics"
+	"github.com/github/gh-ost/go/metrics/tracing"
 	"github.com/github/gh-ost/go/mysql"
 	"github.com/github/gh-ost/go/sql"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -1576,9 +1580,10 @@ func (mgtr *Migrator) addDMLEventsListener() error {
 		mgtr.migrationContext.DatabaseName,
 		mgtr.migrationContext.OriginalTableName,
 		func(dmlEntry *binlog.BinlogEntry) error {
+			eventStruct := newApplyEventStructByDML(dmlEntry)
 			// Use helper to prevent deadlock if buffer fills and executeWriteFuncs exits
 			// This is critical because this callback blocks the event streamer
-			return base.SendWithContext(mgtr.migrationContext.GetContext(), mgtr.applyEventsQueue, newApplyEventStructByDML(dmlEntry))
+			return base.SendWithContext(mgtr.migrationContext.GetContext(), mgtr.applyEventsQueue, eventStruct)
 		},
 	)
 	return err
@@ -1788,8 +1793,7 @@ func (mgtr *Migrator) onApplyEventStruct(eventStruct *applyEventStruct) error {
 		return handleNonDMLEventStruct(eventStruct)
 	}
 	if eventStruct.dmlEvent != nil {
-		dmlEvents := [](*binlog.BinlogDMLEvent){}
-		dmlEvents = append(dmlEvents, eventStruct.dmlEvent)
+		dmlEvents := [](*binlog.BinlogDMLEvent){eventStruct.dmlEvent}
 		var nonDmlStructToApply *applyEventStruct
 		var completedTransaction *applyEventStruct
 
@@ -1811,12 +1815,38 @@ func (mgtr *Migrator) onApplyEventStruct(eventStruct *applyEventStruct) error {
 			}
 			dmlEvents = append(dmlEvents, additionalStruct.dmlEvent)
 		}
-		// Create a task to apply the DML event; this will be execute by executeWriteFuncs()
+
+		// Apply Batch covers SQL apply only. Queue wait / decode latency are
+		// metrics (binlog.backlog_*), not reconstructed binlog spans.
+		inserts, updates, deletes := dmlEventTypeCounts(dmlEvents)
+		applyAttrs := append(
+			tracing.DMLEventAttributes(
+				mgtr.migrationContext.DatabaseName,
+				mgtr.migrationContext.OriginalTableName,
+				eventStruct.dmlEvent.DML.EventTypeTag(),
+			),
+			attribute.Int("dml.batch_size", len(dmlEvents)),
+		)
+		applyAttrs = append(applyAttrs, tracing.DMLTypeCounts(inserts, updates, deletes)...)
+		applyCtx, endApply := tracing.StartWithError(
+			mgtr.migrationContext.GetContext(),
+			mgtr.migrationContext.TracerProvider,
+			tracing.SpanApplyBatch,
+			applyAttrs...,
+		)
+
+		attempt := 0
 		var applyEventFunc tableWriteFunc = func() error {
-			return mgtr.applier.ApplyDMLEventQueries(dmlEvents)
+			attempt++
+			if span := trace.SpanFromContext(applyCtx); span.IsRecording() {
+				span.SetAttributes(attribute.Int("dml.retry_attempt", attempt))
+			}
+			return mgtr.applier.ApplyDMLEventQueries(applyCtx, dmlEvents)
 		}
-		if err := mgtr.retryOperation(applyEventFunc); err != nil {
-			return mgtr.migrationContext.Log.Errore(err)
+		applyErr := mgtr.retryOperation(applyEventFunc)
+		endApply(applyErr)
+		if applyErr != nil {
+			return mgtr.migrationContext.Log.Errore(applyErr)
 		}
 		// update applier coordinates
 		mgtr.applier.CurrentCoordinatesMutex.Lock()
