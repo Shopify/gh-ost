@@ -19,8 +19,8 @@ import (
 	"github.com/github/gh-ost/go/base"
 	"github.com/github/gh-ost/go/binlog"
 	"github.com/github/gh-ost/go/metrics"
-	"github.com/github/gh-ost/go/sql"
 	"github.com/github/gh-ost/go/metrics/tracing"
+	"github.com/github/gh-ost/go/sql"
 
 	"context"
 	"database/sql/driver"
@@ -32,6 +32,7 @@ import (
 	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/openark/golib/sqlutils"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -62,6 +63,23 @@ func newDmlBuildResultError(err error) *dmlBuildResult {
 	return &dmlBuildResult{
 		err: err,
 	}
+}
+
+func dmlEventTypeCounts(dmlEvents []*binlog.BinlogDMLEvent) (inserts, updates, deletes int) {
+	for _, event := range dmlEvents {
+		if event == nil {
+			continue
+		}
+		switch event.DML {
+		case binlog.InsertDML:
+			inserts++
+		case binlog.UpdateDML:
+			updates++
+		case binlog.DeleteDML:
+			deletes++
+		}
+	}
+	return inserts, updates, deletes
 }
 
 // Applier connects and writes the applier-server, which is the server where migration
@@ -1868,23 +1886,73 @@ func (apl *Applier) ApplyDMLEventQueries(ctx context.Context, dmlEvents [](*binl
 	}
 	tp := apl.migrationContext.TracerProvider
 	showWarnings := apl.migrationContext.PanicOnWarnings
-	ctx, endExec := tracing.StartWithError(
-		ctx,
-		tp,
-		tracing.SpanExecuteSQL,
+	inserts, updates, deletes := dmlEventTypeCounts(dmlEvents)
+	parentAttrs := []attribute.KeyValue{
 		attribute.Int("dml.batch_size", len(dmlEvents)),
 		attribute.Bool("dml.show_warnings", showWarnings),
-	)
-	defer func() { endExec(err) }()
+	}
+	parentAttrs = append(parentAttrs, tracing.DMLTypeCounts(inserts, updates, deletes)...)
 
-	var totalDelta int64
+	// Time phases without emitting spans mid-flight so End()/export work does
+	// not inflate spacing between siblings.
+	//
+	// Hierarchy (siblings under each parent):
+	//   execute_sql
+	//   ├── get_connection
+	//   ├── set_session
+	//   └── begin_tx          (Begin → Commit)
+	//       ├── build_queries
+	//       ├── execute_batch
+	//       └── commit_tx
+	//
+	// Apply-queue wait stays metrics-only (binlog.backlog_*); traces cover apply.
+	var (
+		totalDelta     int64
+		statementCount int
+		setupNodes     []tracing.PhaseNode
+		txChildren     []tracing.PhaseNode
+		txStart        time.Time
+		txEnd          time.Time
+		applyStart     = time.Now()
+		applyEnd       time.Time
+	)
+	defer func() {
+		if applyEnd.IsZero() {
+			applyEnd = time.Now()
+		}
+		if statementCount > 0 {
+			parentAttrs = append(parentAttrs, attribute.Int("dml.statement_count", statementCount))
+			if span := trace.SpanFromContext(ctx); span.IsRecording() {
+				span.SetAttributes(attribute.Int("dml.statement_count", statementCount))
+			}
+		}
+		children := append([]tracing.PhaseNode(nil), setupNodes...)
+		if !txStart.IsZero() {
+			if txEnd.IsZero() {
+				txEnd = applyEnd
+			}
+			children = append(children, tracing.PhaseNode{
+				Phase:    tracing.Phase{Name: tracing.SpanBeginTx, Start: txStart, End: txEnd, Err: err},
+				Children: txChildren,
+			})
+		}
+		tracing.EmitTree(ctx, tp, tracing.SpanExecuteSQL, applyStart, applyEnd, parentAttrs, children, err)
+	}()
 
 	err = func() error {
-		var stepErr error
+		var (
+			stepErr error
+			phase   tracing.Phase
+			conn    *gosql.Conn
+			tx      *gosql.Tx
+		)
 
-		ctx, endConn := tracing.StartWithError(ctx, tp, tracing.SpanGetConnection)
-		conn, stepErr := apl.db.Conn(ctx)
-		endConn(stepErr)
+		phase, stepErr = tracing.Measure(tracing.SpanGetConnection, func() error {
+			var connErr error
+			conn, connErr = apl.db.Conn(ctx)
+			return connErr
+		})
+		setupNodes = append(setupNodes, tracing.PhaseNode{Phase: phase})
 		if stepErr != nil {
 			return stepErr
 		}
@@ -1892,109 +1960,118 @@ func (apl *Applier) ApplyDMLEventQueries(ctx context.Context, dmlEvents [](*binl
 
 		sessionQuery := "SET /* gh-ost */ SESSION time_zone = '+00:00'"
 		sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, apl.generateSqlModeQuery())
-		ctx, endSession := tracing.StartWithError(ctx, tp, tracing.SpanSetSession)
-		_, stepErr = conn.ExecContext(ctx, sessionQuery)
-		endSession(stepErr)
+		phase, stepErr = tracing.Measure(tracing.SpanSetSession, func() error {
+			_, execErr := conn.ExecContext(ctx, sessionQuery)
+			return execErr
+		})
+		setupNodes = append(setupNodes, tracing.PhaseNode{Phase: phase})
 		if stepErr != nil {
 			return stepErr
 		}
 
-		ctx, endBegin := tracing.StartWithError(ctx, tp, tracing.SpanBeginTx)
-		tx, stepErr := conn.BeginTx(ctx, nil)
-		endBegin(stepErr)
+		txStart = time.Now()
+		tx, stepErr = conn.BeginTx(ctx, nil)
 		if stepErr != nil {
+			txEnd = time.Now()
 			return stepErr
 		}
 		rollback := func(err error) error {
 			tx.Rollback()
+			txEnd = time.Now()
 			return err
 		}
 
-		ctx, endBuild := tracing.StartWithError(ctx, tp, tracing.SpanBuildQueries)
-		buildResults := make([]*dmlBuildResult, 0, len(dmlEvents))
-		nArgs := 0
-		for _, dmlEvent := range dmlEvents {
-			for _, buildResult := range apl.buildDMLEventQuery(dmlEvent) {
-				if buildResult.err != nil {
-					endBuild(buildResult.err)
-					return rollback(buildResult.err)
-				}
-				nArgs += len(buildResult.args)
-				buildResults = append(buildResults, buildResult)
-			}
-		}
-		endBuild(nil)
-
-		ctx, endBatch := tracing.StartWithError(
-			ctx,
-			tp,
-			tracing.SpanExecuteBatch,
-			attribute.Bool("dml.show_warnings", showWarnings),
-			attribute.Int("dml.statement_count", len(buildResults)),
+		var (
+			buildResults []*dmlBuildResult
+			nArgs        int
 		)
+		phase, stepErr = tracing.Measure(tracing.SpanBuildQueries, func() error {
+			buildResults = make([]*dmlBuildResult, 0, len(dmlEvents))
+			nArgs = 0
+			for _, dmlEvent := range dmlEvents {
+				for _, buildResult := range apl.buildDMLEventQuery(dmlEvent) {
+					if buildResult.err != nil {
+						return buildResult.err
+					}
+					nArgs += len(buildResult.args)
+					buildResults = append(buildResults, buildResult)
+				}
+			}
+			return nil
+		})
+		txChildren = append(txChildren, tracing.PhaseNode{Phase: phase})
+		if stepErr != nil {
+			return rollback(stepErr)
+		}
+		statementCount = len(buildResults)
+
+		batchAttrs := []attribute.KeyValue{
+			attribute.Bool("dml.show_warnings", showWarnings),
+			attribute.Int("dml.statement_count", statementCount),
+		}
 		// When PanicOnWarnings is enabled, we need to check warnings after each statement
 		// in the batch. SHOW WARNINGS only shows warnings from the last statement in a
 		// multi-statement query, so we interleave SHOW WARNINGS after each DML statement.
-		if showWarnings {
+		phase, stepErr = tracing.Measure(tracing.SpanExecuteBatch, func() error {
 			queryStartTime := time.Now()
-			totalDelta, stepErr = apl.executeBatchWithWarningChecking(ctx, tx, buildResults)
-			metrics.RecordQueryDuration(apl.migrationContext.Metrics, "target", "binlog_apply", time.Since(queryStartTime), stepErr)
-			endBatch(stepErr)
-			if stepErr != nil {
-				return rollback(stepErr)
-			}
-		} else {
-			// Fast path: batch together DML queries into multi-statements to minimize network trips.
-			// We use the raw driver connection to access the rows affected for each statement.
-			queryStartTime := time.Now()
-			execErr := conn.Raw(func(driverConn any) error {
-				ex := driverConn.(driver.ExecerContext)
-				nvc := driverConn.(driver.NamedValueChecker)
+			var batchErr error
+			if showWarnings {
+				totalDelta, batchErr = apl.executeBatchWithWarningChecking(ctx, tx, buildResults)
+			} else {
+				// Fast path: batch together DML queries into multi-statements to minimize network trips.
+				// We use the raw driver connection to access the rows affected for each statement.
+				batchErr = conn.Raw(func(driverConn any) error {
+					ex := driverConn.(driver.ExecerContext)
+					nvc := driverConn.(driver.NamedValueChecker)
 
-				multiArgs := make([]driver.NamedValue, 0, nArgs)
-				multiQueryBuilder := strings.Builder{}
-				for _, buildResult := range buildResults {
-					for _, arg := range buildResult.args {
-						nv := driver.NamedValue{Value: driver.Value(arg)}
-						nvc.CheckNamedValue(&nv)
-						multiArgs = append(multiArgs, nv)
+					multiArgs := make([]driver.NamedValue, 0, nArgs)
+					multiQueryBuilder := strings.Builder{}
+					for _, buildResult := range buildResults {
+						for _, arg := range buildResult.args {
+							nv := driver.NamedValue{Value: driver.Value(arg)}
+							nvc.CheckNamedValue(&nv)
+							multiArgs = append(multiArgs, nv)
+						}
+
+						multiQueryBuilder.WriteString(buildResult.query)
+						multiQueryBuilder.WriteString(";\n")
 					}
 
-					multiQueryBuilder.WriteString(buildResult.query)
-					multiQueryBuilder.WriteString(";\n")
-				}
+					res, err := ex.ExecContext(ctx, multiQueryBuilder.String(), multiArgs)
+					if err != nil {
+						err = fmt.Errorf("%w; query=%s; args=%+v", err, multiQueryBuilder.String(), multiArgs)
+						return err
+					}
 
-				res, err := ex.ExecContext(ctx, multiQueryBuilder.String(), multiArgs)
-				if err != nil {
-					err = fmt.Errorf("%w; query=%s; args=%+v", err, multiQueryBuilder.String(), multiArgs)
-					return err
-				}
+					mysqlRes := res.(drivermysql.Result)
 
-				mysqlRes := res.(drivermysql.Result)
-
-				// each DML is either a single insert (delta +1), update (delta +0) or delete (delta -1).
-				// multiplying by the rows actually affected (either 0 or 1) will give an accurate row delta for this DML event
-				for i, rowsAffected := range mysqlRes.AllRowsAffected() {
-					totalDelta += buildResults[i].rowsDelta * rowsAffected
-				}
-				return nil
-			})
-
-			metrics.RecordQueryDuration(apl.migrationContext.Metrics, "target", "binlog_apply", time.Since(queryStartTime), execErr)
-			endBatch(execErr)
-			if execErr != nil {
-				return rollback(execErr)
+					// each DML is either a single insert (delta +1), update (delta +0) or delete (delta -1).
+					// multiplying by the rows actually affected (either 0 or 1) will give an accurate row delta for this DML event
+					for i, rowsAffected := range mysqlRes.AllRowsAffected() {
+						totalDelta += buildResults[i].rowsDelta * rowsAffected
+					}
+					return nil
+				})
 			}
+			metrics.RecordQueryDuration(apl.migrationContext.Metrics, "target", "binlog_apply", time.Since(queryStartTime), batchErr)
+			return batchErr
+		}, batchAttrs...)
+		txChildren = append(txChildren, tracing.PhaseNode{Phase: phase})
+		if stepErr != nil {
+			return rollback(stepErr)
 		}
 
-		_, endCommit := tracing.StartWithError(ctx, tp, tracing.SpanCommitTx)
-		commitErr := tx.Commit()
-		endCommit(commitErr)
-		if commitErr != nil {
-			return commitErr
+		phase, stepErr = tracing.Measure(tracing.SpanCommitTx, func() error {
+			return tx.Commit()
+		})
+		txChildren = append(txChildren, tracing.PhaseNode{Phase: phase})
+		txEnd = time.Now()
+		if stepErr != nil {
+			return stepErr
 		}
 		return nil
 	}()
+	applyEnd = time.Now()
 
 	if err != nil {
 		return apl.migrationContext.Log.Errore(err)

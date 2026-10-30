@@ -19,11 +19,12 @@ import (
 	"github.com/github/gh-ost/go/base"
 	"github.com/github/gh-ost/go/binlog"
 	"github.com/github/gh-ost/go/metrics"
+	"github.com/github/gh-ost/go/metrics/tracing"
 	"github.com/github/gh-ost/go/mysql"
 	"github.com/github/gh-ost/go/sql"
-	"github.com/github/gh-ost/go/metrics/tracing"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -1815,22 +1816,31 @@ func (mgtr *Migrator) onApplyEventStruct(eventStruct *applyEventStruct) error {
 			dmlEvents = append(dmlEvents, additionalStruct.dmlEvent)
 		}
 
+		// Apply Batch covers SQL apply only. Queue wait / decode latency are
+		// metrics (binlog.backlog_*), not reconstructed binlog spans.
+		inserts, updates, deletes := dmlEventTypeCounts(dmlEvents)
+		applyAttrs := append(
+			tracing.DMLEventAttributes(
+				mgtr.migrationContext.DatabaseName,
+				mgtr.migrationContext.OriginalTableName,
+				eventStruct.dmlEvent.DML.EventTypeTag(),
+			),
+			attribute.Int("dml.batch_size", len(dmlEvents)),
+		)
+		applyAttrs = append(applyAttrs, tracing.DMLTypeCounts(inserts, updates, deletes)...)
 		applyCtx, endApply := tracing.StartWithError(
 			mgtr.migrationContext.GetContext(),
 			mgtr.migrationContext.TracerProvider,
 			tracing.SpanApplyBatch,
-			append(
-				tracing.DMLEventAttributes(
-					mgtr.migrationContext.DatabaseName,
-					mgtr.migrationContext.OriginalTableName,
-					eventStruct.dmlEvent.DML.EventTypeTag(),
-				),
-				attribute.Int("dml.batch_size", len(dmlEvents)),
-			)...,
+			applyAttrs...,
 		)
 
-		// Create a task to apply the DML event; this will be execute by executeWriteFuncs()
+		attempt := 0
 		var applyEventFunc tableWriteFunc = func() error {
+			attempt++
+			if span := trace.SpanFromContext(applyCtx); span.IsRecording() {
+				span.SetAttributes(attribute.Int("dml.retry_attempt", attempt))
+			}
 			return mgtr.applier.ApplyDMLEventQueries(applyCtx, dmlEvents)
 		}
 		applyErr := mgtr.retryOperation(applyEventFunc)
