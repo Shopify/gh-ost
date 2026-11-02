@@ -108,7 +108,7 @@ type Migrator struct {
 	copyRowsQueue    chan tableWriteFunc
 	applyEventsQueue chan *applyEventStruct
 	// A dequeued ordering barrier held by the throttled worker still counts as backlog.
-	pendingThrottledEvent int64
+	pendingThrottledEvent atomic.Bool
 
 	finishedMigrating int64
 }
@@ -1976,7 +1976,7 @@ func (mgtr *Migrator) checkpointLoop() {
 func (mgtr *Migrator) throttleApplyEvents() (*applyEventStruct, error) {
 	var pending *applyEventStruct
 	var drainErr error
-	defer atomic.StoreInt64(&mgtr.pendingThrottledEvent, 0)
+	defer mgtr.pendingThrottledEvent.Store(false)
 	mgtr.throttler.throttle(func() {
 		if pending != nil || drainErr != nil {
 			return
@@ -1990,7 +1990,7 @@ func (mgtr *Migrator) throttleApplyEvents() (*applyEventStruct, error) {
 			event := <-mgtr.applyEventsQueue
 			if !event.isBookkeeping() {
 				pending = event
-				atomic.StoreInt64(&mgtr.pendingThrottledEvent, 1)
+				mgtr.pendingThrottledEvent.Store(true)
 				return
 			}
 			if drainErr = mgtr.onApplyEventStruct(event); drainErr != nil {
@@ -2006,6 +2006,20 @@ func (mgtr *Migrator) throttleApplyEvents() (*applyEventStruct, error) {
 		return nil, err
 	}
 	return pending, nil
+}
+
+// throttleAndApplyPendingEvent applies any ordering barrier held during the
+// throttle wait before the caller reads more work. When applied is true, the
+// caller must restart its loop to recheck throttling before processing more work.
+func (mgtr *Migrator) throttleAndApplyPendingEvent() (applied bool, err error) {
+	pending, err := mgtr.throttleApplyEvents()
+	if err != nil {
+		return false, err
+	}
+	if pending == nil {
+		return false, nil
+	}
+	return true, mgtr.onApplyEventStruct(pending)
 }
 
 // executeWriteFuncs writes data via applier: both the rowcopy and the events backlog.
@@ -2024,14 +2038,9 @@ func (mgtr *Migrator) executeWriteFuncs() error {
 			return nil
 		}
 
-		pending, err := mgtr.throttleApplyEvents()
-		if err != nil {
+		if applied, err := mgtr.throttleAndApplyPendingEvent(); err != nil {
 			return err
-		}
-		if pending != nil {
-			if err := mgtr.onApplyEventStruct(pending); err != nil {
-				return err
-			}
+		} else if applied {
 			continue
 		}
 
@@ -2089,14 +2098,9 @@ func (mgtr *Migrator) executeDMLWriteFuncs() error {
 			return nil
 		}
 
-		pending, err := mgtr.throttleApplyEvents()
-		if err != nil {
+		if applied, err := mgtr.throttleAndApplyPendingEvent(); err != nil {
 			return err
-		}
-		if pending != nil {
-			if err := mgtr.onApplyEventStruct(pending); err != nil {
-				return err
-			}
+		} else if applied {
 			continue
 		}
 

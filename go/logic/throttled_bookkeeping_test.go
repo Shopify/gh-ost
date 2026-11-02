@@ -125,7 +125,7 @@ func TestThrottledBookkeepingStopsAtOrderingBarrier(t *testing.T) {
 					done <- err
 				}()
 				require.Eventually(t, func() bool {
-					return atomic.LoadInt64(&mgtr.pendingThrottledEvent) == 1
+					return mgtr.pendingThrottledEvent.Load()
 				}, 3*time.Second, 10*time.Millisecond)
 				// Allow multiple throttle ticks: later bookkeeping must stay queued.
 				time.Sleep(550 * time.Millisecond)
@@ -177,7 +177,7 @@ func TestThrottledWorkersResumeBarrierBeforeLaterBookkeeping(t *testing.T) {
 				}
 			}()
 			require.Eventually(t, func() bool {
-				return atomic.LoadInt64(&mgtr.pendingThrottledEvent) == 1
+				return mgtr.pendingThrottledEvent.Load()
 			}, 3*time.Second, 10*time.Millisecond)
 			require.Zero(t, calls.Load())
 			mgtr.migrationContext.SetThrottled(false, "", base.NoThrottleReasonHint)
