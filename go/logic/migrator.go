@@ -55,6 +55,12 @@ type applyEventStruct struct {
 	dmlEvent            *binlog.BinlogDMLEvent
 	coords              mysql.BinlogCoordinates
 	transactionComplete bool
+	heartbeat           bool
+}
+
+// Only these explicitly classified entries may run while writes are throttled.
+func (event *applyEventStruct) isBookkeeping() bool {
+	return event.dmlEvent == nil && event.writeFunc == nil && (event.heartbeat || event.transactionComplete)
 }
 
 func newApplyEventStructByFunc(writeFunc *tableWriteFunc) *applyEventStruct {
@@ -101,6 +107,8 @@ type Migrator struct {
 	//  excessive work happens at the end of the iteration as new copy-jobs arrive before realizing the copy is complete
 	copyRowsQueue    chan tableWriteFunc
 	applyEventsQueue chan *applyEventStruct
+	// A dequeued ordering barrier held by the throttled worker still counts as backlog.
+	pendingThrottledEvent atomic.Bool
 
 	finishedMigrating int64
 }
@@ -350,17 +358,10 @@ func (mgtr *Migrator) onChangelogHeartbeatEvent(dmlEntry *binlog.BinlogEntry) (e
 
 	// Route the coords bump through applyEventsQueue so it is ordered after
 	// any DMLs the streamer enqueued before this heartbeat.
-	coords := dmlEntry.Coordinates
-	var writeFunc tableWriteFunc = func() error {
-		mgtr.applier.CurrentCoordinatesMutex.Lock()
-		mgtr.applier.CurrentCoordinates = coords
-		mgtr.applier.CurrentCoordinatesMutex.Unlock()
-		return nil
-	}
 	if err := base.SendWithContext(
 		mgtr.migrationContext.GetContext(),
 		mgtr.applyEventsQueue,
-		newApplyEventStructByFunc(&writeFunc),
+		&applyEventStruct{coords: dmlEntry.Coordinates.Clone(), heartbeat: true},
 	); err != nil {
 		return mgtr.migrationContext.Log.Errore(err)
 	}
@@ -1781,6 +1782,11 @@ func (mgtr *Migrator) onApplyEventStruct(eventStruct *applyEventStruct) error {
 		return err
 	}
 	handleNonDMLEventStruct := func(eventStruct *applyEventStruct) error {
+		if eventStruct.heartbeat {
+			mgtr.applier.CurrentCoordinatesMutex.Lock()
+			mgtr.applier.CurrentCoordinates = eventStruct.coords.Clone()
+			mgtr.applier.CurrentCoordinatesMutex.Unlock()
+		}
 		if eventStruct.transactionComplete {
 			mgtr.applier.CurrentCoordinatesMutex.Lock()
 			mgtr.applier.AppliedTransactionCoordinates = eventStruct.coords.Clone()
@@ -1973,6 +1979,58 @@ func (mgtr *Migrator) checkpointLoop() {
 	}
 }
 
+// throttleApplyEvents drains only the bookkeeping prefix while throttled. The
+// first write/cutover callback is held as an ordering barrier, never re-enqueued
+// behind newer events. Both writer loops must apply it before reading the queue.
+func (mgtr *Migrator) throttleApplyEvents() (*applyEventStruct, error) {
+	var pending *applyEventStruct
+	var drainErr error
+	defer mgtr.pendingThrottledEvent.Store(false)
+	mgtr.throttler.throttle(func() {
+		if pending != nil || drainErr != nil {
+			return
+		}
+		// Bound each pass so a continuous stream cannot starve throttle and
+		// cancellation checks. The next throttle tick resumes draining.
+		for remaining := len(mgtr.applyEventsQueue); remaining > 0; remaining-- {
+			if drainErr = mgtr.checkAbort(); drainErr != nil {
+				return
+			}
+			event := <-mgtr.applyEventsQueue
+			if !event.isBookkeeping() {
+				pending = event
+				mgtr.pendingThrottledEvent.Store(true)
+				return
+			}
+			if drainErr = mgtr.onApplyEventStruct(event); drainErr != nil {
+				mgtr.abort(drainErr)
+				return
+			}
+		}
+	})
+	if drainErr != nil {
+		return nil, drainErr
+	}
+	if err := mgtr.checkAbort(); err != nil {
+		return nil, err
+	}
+	return pending, nil
+}
+
+// throttleAndApplyPendingEvent applies any ordering barrier held during the
+// throttle wait before the caller reads more work. When applied is true, the
+// caller must restart its loop to recheck throttling before processing more work.
+func (mgtr *Migrator) throttleAndApplyPendingEvent() (applied bool, err error) {
+	pending, err := mgtr.throttleApplyEvents()
+	if err != nil {
+		return false, err
+	}
+	if pending == nil {
+		return false, nil
+	}
+	return true, mgtr.onApplyEventStruct(pending)
+}
+
 // executeWriteFuncs writes data via applier: both the rowcopy and the events backlog.
 // This is where the ghost table gets the data. The function fills the data single-threaded.
 // Both event backlog and rowcopy events are polled; the backlog events have precedence.
@@ -1989,7 +2047,11 @@ func (mgtr *Migrator) executeWriteFuncs() error {
 			return nil
 		}
 
-		mgtr.throttler.throttle(nil)
+		if applied, err := mgtr.throttleAndApplyPendingEvent(); err != nil {
+			return err
+		} else if applied {
+			continue
+		}
 
 		// We give higher priority to event processing, then secondary priority to
 		// rowcopy
@@ -2045,7 +2107,11 @@ func (mgtr *Migrator) executeDMLWriteFuncs() error {
 			return nil
 		}
 
-		mgtr.throttler.throttle(nil)
+		if applied, err := mgtr.throttleAndApplyPendingEvent(); err != nil {
+			return err
+		} else if applied {
+			continue
+		}
 
 		select {
 		case eventStruct := <-mgtr.applyEventsQueue:

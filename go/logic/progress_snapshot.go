@@ -47,12 +47,17 @@ func (mgtr *Migrator) migrationProgressSnapshot() migrationProgressSnapshot {
 		streamerBinlogPosition = mgtr.eventsStreamer.GetCurrentBinlogCoordinates().DisplayString()
 	}
 
+	applyEventsBacklog := len(mgtr.applyEventsQueue)
+	if mgtr.pendingThrottledEvent.Load() {
+		applyEventsBacklog++
+	}
+
 	return migrationProgressSnapshot{
 		totalRowsCopied:        totalRowsCopied,
 		rowsEstimate:           rowsEstimate,
 		progressPct:            progressPct,
 		dmlApplied:             atomic.LoadInt64(&mgtr.migrationContext.TotalDMLEventsApplied),
-		applyEventsBacklog:     len(mgtr.applyEventsQueue),
+		applyEventsBacklog:     applyEventsBacklog,
 		applyEventsCapacity:    cap(mgtr.applyEventsQueue),
 		state:                  state,
 		eta:                    eta,
