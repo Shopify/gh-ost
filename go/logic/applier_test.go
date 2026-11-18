@@ -452,7 +452,7 @@ func (suite *ApplierTestSuite) TestApplyDMLEventQueries() {
 			NewColumnValues: sql.ToColumnValues([]interface{}{123456, 42}),
 		},
 	}
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().NoError(err)
 
 	// Check that the row was inserted
@@ -783,7 +783,7 @@ func (suite *ApplierTestSuite) TestPanicOnWarningsInApplyIterationInsertQuerySuc
 			NewColumnValues: sql.ToColumnValues([]interface{}{123456, 42}),
 		},
 	}
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().NoError(err)
 
 	err = applier.CreateChangelogTable()
@@ -1034,7 +1034,7 @@ func (suite *ApplierTestSuite) TestPanicOnWarningsWithDuplicateKeyOnNonMigration
 	}
 
 	// This should return an error when PanicOnWarnings is enabled
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().Error(err)
 	suite.Require().Contains(err.Error(), "Duplicate entry")
 
@@ -1124,7 +1124,7 @@ func (suite *ApplierTestSuite) TestPanicOnWarningsWithDuplicateCompositeUniqueKe
 	}
 
 	// This should return an error when PanicOnWarnings is enabled
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().Error(err)
 	suite.Require().Contains(err.Error(), "Duplicate entry")
 
@@ -1236,7 +1236,7 @@ func (suite *ApplierTestSuite) TestUpdateModifyingUniqueKeyWithDuplicateOnOtherI
 	suite.Require().Len(buildResults, 2, "UPDATE modifying unique key should be converted to DELETE+INSERT")
 
 	// Apply the event - this should FAIL because INSERT will have duplicate email warning
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().Error(err, "Should fail when DELETE+INSERT causes duplicate on non-migration unique key")
 	suite.Require().Contains(err.Error(), "Duplicate entry", "Error should mention duplicate entry")
 
@@ -1325,7 +1325,7 @@ func (suite *ApplierTestSuite) TestNormalUpdateWithPanicOnWarnings() {
 	suite.Require().Len(buildResults, 1, "Normal UPDATE should generate single UPDATE query")
 
 	// Apply the event - should succeed
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().NoError(err)
 
 	// Verify the update was applied correctly
@@ -1400,7 +1400,7 @@ func (suite *ApplierTestSuite) TestDuplicateOnMigrationKeyAllowedInBinlogReplay(
 	}
 
 	// This should succeed - duplicate on migration unique key is expected and should be filtered out
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().NoError(err)
 
 	// Verify that the ghost table still has only the original 2 rows with correct data
@@ -1491,7 +1491,7 @@ func (suite *ApplierTestSuite) TestRegexMetacharactersInIndexName() {
 		},
 	}
 
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().NoError(err, "Duplicate on idx+email (migration key) should be allowed with PanicOnWarnings enabled")
 
 	// Test: duplicate on PRIMARY (not the migration key) should fail
@@ -1504,7 +1504,7 @@ func (suite *ApplierTestSuite) TestRegexMetacharactersInIndexName() {
 		},
 	}
 
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().Error(err, "Duplicate on PRIMARY (not migration key) should fail with PanicOnWarnings enabled")
 	suite.Require().Contains(err.Error(), "Duplicate entry")
 
@@ -1593,7 +1593,7 @@ func (suite *ApplierTestSuite) TestPanicOnWarningsDisabled() {
 	}
 
 	// Should succeed because PanicOnWarnings is disabled
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().NoError(err)
 
 	// Verify that only 2 original rows exist with correct data (the duplicate was silently ignored)
@@ -1699,7 +1699,7 @@ func (suite *ApplierTestSuite) TestMultipleDMLEventsInBatch() {
 	}
 
 	// Should fail due to the second event
-	err = applier.ApplyDMLEventQueries(dmlEvents)
+	err = applier.ApplyDMLEventQueries(context.Background(), dmlEvents)
 	suite.Require().Error(err)
 	suite.Require().Contains(err.Error(), "Duplicate entry")
 

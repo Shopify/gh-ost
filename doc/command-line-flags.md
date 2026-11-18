@@ -444,6 +444,18 @@ StatsD endpoint, either `host:port` or a Unix socket. Empty disables StatsD.
 
 Global StatsD tags applied to every metric. This flag is repeatable and uses `key:value` format. Example: `--statsd-tags 'env:prod' --statsd-tags 'service:gh-ost'`.
 
+### otel-endpoint
+
+OTLP/HTTP trace exporter endpoint URL. Empty disables tracing. Example: `http://localhost:4318/v1/traces`.
+
+When enabled, gh-ost exports apply-path spans (e.g. `Apply Batch` → `dml.execute_sql` and children) via a batched OTLP exporter. The batch processor uses a large in-memory queue and **blocks** the apply path when the queue is full instead of dropping spans, so TraceQL metrics (for example `sum_over_time(span.dml.batch_size)`) stay complete. If the collector or Tempo cannot keep up, apply throughput may stall briefly; fix export capacity rather than disabling blocking. Apply-queue depth remains a StatsD metric (`binlog.backlog_*`), not a reconstructed binlog span.
+
+Ensure the collector's traces pipeline does not use a verbose `debug` exporter (it can backpressure and historically caused large under-counts vs StatsD).
+
+### otel-attributes
+
+Global OpenTelemetry resource attributes applied to every exported span when tracing is enabled. This flag is repeatable and uses `key:value` format. Example: `--otel-attributes 'env:prod' --otel-attributes 'migration:orders_v2'`.
+
 ### storage-engine
 Default is `innodb`, and `rocksdb` support is currently experimental. InnoDB and RocksDB are both transactional engines, supporting both shared and exclusive row locks.
 

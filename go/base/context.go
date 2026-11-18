@@ -25,6 +25,7 @@ import (
 	"github.com/openark/golib/log"
 
 	"github.com/go-ini/ini"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // RowsEstimateMethod is the type of row number estimation
@@ -239,6 +240,8 @@ type MigrationContext struct {
 	abortMutex *sync.Mutex
 
 	Metrics metrics.Emitter
+
+	TracerProvider trace.TracerProvider
 
 	OriginalTableColumnsOnApplier    *sql.ColumnList
 	OriginalTableColumns             *sql.ColumnList
