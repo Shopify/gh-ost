@@ -104,6 +104,16 @@ See also: [`resuming-migrations`](resume.md)
 
 Controls how many rows `gh-ost` copies in each row-copy iteration. The default is `1000`; allowed range is `10` to `100000`.
 
+### auto-chunk-size
+
+`--auto-chunk-size` retunes `chunk-size` every 60 seconds during row copy, starting from `--chunk-size`:
+
+- If the p95 chunk INSERT latency is above `--auto-chunk-size-target-high-millis` (default `20`), or `gh-ost` was throttled for more than 20% of the window, the chunk shrinks by 25%.
+- If the p95 is below `--auto-chunk-size-target-low-millis` (default `10`), the chunk grows by 10%.
+- The chunk stays within `--auto-chunk-size-min` (default `50`) and `--auto-chunk-size-max` (default `5000`). A warning is logged if it is at the minimum and still over target.
+
+Setting `chunk-size=N` over the interactive socket sets the size the next adjustment starts from.
+
 ### conf
 
 `--conf=/path/to/my.cnf`: file where credentials are specified. Should be in (or contain) the following format:
