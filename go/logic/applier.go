@@ -1189,9 +1189,13 @@ func (apl *Applier) ApplyIterationInsertQuery() (chunkSize int64, rowsAffected i
 		}
 		queryStartTime := time.Now()
 		result, err := tx.Exec(query, explodedArgs...)
-		metrics.RecordQueryDuration(apl.migrationContext.Metrics, "target", "chunk_copy", time.Since(queryStartTime), err)
+		queryDuration := time.Since(queryStartTime)
+		metrics.RecordQueryDuration(apl.migrationContext.Metrics, "target", "chunk_copy", queryDuration, err)
 		if err != nil {
 			return nil, err
+		}
+		if apl.migrationContext.AutoChunkSize {
+			apl.migrationContext.ChunkTuner.RecordLatency(queryDuration)
 		}
 
 		if apl.migrationContext.PanicOnWarnings {

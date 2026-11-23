@@ -631,6 +631,9 @@ func (mgtr *Migrator) Migrate() (err error) {
 		}
 	}()
 	go mgtr.iterateChunks()
+	if mgtr.migrationContext.AutoChunkSize {
+		go mgtr.autoChunkSizeLoop()
+	}
 	mgtr.migrationContext.MarkRowCopyStartTime()
 	go mgtr.initiateStatus()
 	if mgtr.migrationContext.Checkpoint {
@@ -1932,6 +1935,57 @@ func (mgtr *Migrator) CheckpointAfterCutOver() (*Checkpoint, error) {
 	id, err := mgtr.applier.WriteCheckpoint(mgtr.migrationContext.GetContext(), chk)
 	chk.Id = id
 	return chk, err
+}
+
+// autoChunkSizeLoop retunes ChunkSize once per window until row copy completes.
+func (mgtr *Migrator) autoChunkSizeLoop() {
+	mctx := mgtr.migrationContext
+	minSize, maxSize := mctx.AutoChunkSizeMin, mctx.AutoChunkSizeMax
+	targetLow := time.Duration(mctx.AutoChunkSizeTargetLowMillis) * time.Millisecond
+	targetHigh := time.Duration(mctx.AutoChunkSizeTargetHighMillis) * time.Millisecond
+
+	start := atomic.LoadInt64(&mctx.ChunkSize)
+	start = max(minSize, min(maxSize, start))
+	mctx.SetChunkSize(start)
+	mctx.ChunkTuner.Drain()
+	mctx.Log.Infof("auto-chunk-size: starting at %d (bounds %d-%d, target p95 %v-%v)", start, minSize, maxSize, targetLow, targetHigh)
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	windowTicks := int(base.ChunkTunerWindow / time.Second)
+	var ticks, throttledTicks int
+	for {
+		select {
+		case <-mctx.GetContext().Done():
+			return
+		case <-ticker.C:
+		}
+		if atomic.LoadInt64(&mgtr.rowCopyCompleteFlag) == 1 {
+			return
+		}
+		ticks++
+		if throttled, _, _ := mctx.IsThrottled(); throttled {
+			throttledTicks++
+		}
+		if ticks < windowTicks {
+			continue
+		}
+
+		samples := mctx.ChunkTuner.Drain()
+		p95 := base.P95(samples)
+		throttledRatio := float64(throttledTicks) / float64(ticks)
+		ticks, throttledTicks = 0, 0
+
+		current := atomic.LoadInt64(&mctx.ChunkSize)
+		next, stuckAtMin := base.NextChunkSize(current, minSize, maxSize, p95, targetLow, targetHigh, throttledRatio, len(samples))
+		if next != current {
+			mctx.SetChunkSize(next)
+		}
+		mctx.Log.Infof("auto-chunk-size: chunks=%d p95=%v throttled=%.0f%% chunk-size %d -> %d", len(samples), p95, throttledRatio*100, current, next)
+		if stuckAtMin {
+			mctx.Log.Warningf("auto-chunk-size: at minimum %d but still over target (p95=%v, throttled=%.0f%%)", minSize, p95, throttledRatio*100)
+		}
+	}
 }
 
 func (mgtr *Migrator) checkpointLoop() {

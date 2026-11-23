@@ -131,6 +131,12 @@ type MigrationContext struct {
 	HeartbeatIntervalMilliseconds       int64
 	defaultNumRetries                   int64
 	ChunkSize                           int64
+	AutoChunkSize                       bool
+	AutoChunkSizeMin                    int64
+	AutoChunkSizeMax                    int64
+	AutoChunkSizeTargetLowMillis        int64
+	AutoChunkSizeTargetHighMillis       int64
+	ChunkTuner                          ChunkTuner
 	niceRatio                           float64
 	MaxLagMillisecondsThrottleThreshold int64
 	throttleControlReplicaKeys          *mysql.InstanceKeyMap

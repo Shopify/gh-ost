@@ -123,6 +123,11 @@ func main() {
 	flag.BoolVar(&migrationContext.CutOverExponentialBackoff, "cut-over-exponential-backoff", false, "Wait exponentially longer intervals between failed cut-over attempts. Wait intervals obey a maximum configurable with 'exponential-backoff-max-interval').")
 	exponentialBackoffMaxInterval := flag.Int64("exponential-backoff-max-interval", 64, "Maximum number of seconds to wait between attempts when performing various operations with exponential backoff.")
 	chunkSize := flag.Int64("chunk-size", 1000, "amount of rows to handle in each iteration (allowed range: 10-100,000)")
+	flag.BoolVar(&migrationContext.AutoChunkSize, "auto-chunk-size", false, "every 60s, adjust chunk-size toward the target p95 chunk-copy latency; shrink when throttled >20% of the window")
+	flag.Int64Var(&migrationContext.AutoChunkSizeMin, "auto-chunk-size-min", 50, "lower bound for auto-chunk-size")
+	flag.Int64Var(&migrationContext.AutoChunkSizeMax, "auto-chunk-size-max", 5000, "upper bound for auto-chunk-size")
+	flag.Int64Var(&migrationContext.AutoChunkSizeTargetLowMillis, "auto-chunk-size-target-low-millis", 10, "auto-chunk-size grows the chunk when p95 chunk-copy latency is below this")
+	flag.Int64Var(&migrationContext.AutoChunkSizeTargetHighMillis, "auto-chunk-size-target-high-millis", 20, "auto-chunk-size shrinks the chunk when p95 chunk-copy latency is above this")
 	dmlBatchSize := flag.Int64("dml-batch-size", 10, "batch size for DML events to apply in a single transaction (range 1-1000)")
 	defaultRetries := flag.Int64("default-retries", 60, "Default number of retries for various operations before panicking")
 	flag.BoolVar(&migrationContext.PanicOnWarnings, "panic-on-warnings", false, "Panic when SQL warnings are encountered when copying a batch indicating data loss")
@@ -333,6 +338,14 @@ func main() {
 	}
 	if *storageEngine == "rocksdb" {
 		migrationContext.Log.Warning("RocksDB storage engine support is experimental")
+	}
+	if migrationContext.AutoChunkSize {
+		if migrationContext.AutoChunkSizeMin < 10 || migrationContext.AutoChunkSizeMax > 100000 || migrationContext.AutoChunkSizeMin > migrationContext.AutoChunkSizeMax {
+			migrationContext.Log.Fatalf("--auto-chunk-size-min and --auto-chunk-size-max must satisfy 10 <= min <= max <= 100000")
+		}
+		if migrationContext.AutoChunkSizeTargetLowMillis <= 0 || migrationContext.AutoChunkSizeTargetLowMillis > migrationContext.AutoChunkSizeTargetHighMillis {
+			migrationContext.Log.Fatalf("--auto-chunk-size-target-low-millis must be > 0 and <= --auto-chunk-size-target-high-millis")
+		}
 	}
 	if migrationContext.CheckpointIntervalSeconds < 10 {
 		migrationContext.Log.Fatalf("--checkpoint-seconds should be >=10")
